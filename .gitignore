@@ -1,0 +1,11 @@
+# Build output (anchored to the repo root, so cmd/codefactory/ is not ignored)
+/codefactory
+/codefactory.exe
+
+# Local control plane state
+*.db
+*.db-shm
+*.db-wal
+
+# Worker state: repo cache, worktrees, worker id
+.factory/
