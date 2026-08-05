@@ -127,8 +127,14 @@ func taskList(args []string) error {
 		if t.GitHubIssueNumber != nil {
 			issue = fmt.Sprintf("#%d", *t.GitHubIssueNumber)
 		}
+		// A queued task serving its backoff is not stuck; say so, or it looks
+		// like the queue has stalled.
+		status := t.Status
+		if t.RunAfter != nil && t.RunAfter.After(time.Now()) {
+			status = fmt.Sprintf("%s (retry in %s)", t.Status, time.Until(*t.RunAfter).Round(time.Second))
+		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			t.ID, t.Kind, t.Status, t.FullName(), issue,
+			t.ID, t.Kind, status, t.FullName(), issue,
 			age(t.CreatedAt), truncate(t.Title, 50))
 	}
 	return tw.Flush()
@@ -170,6 +176,11 @@ func taskShow(args []string) error {
 	}
 	if task.LeaseExpiresAt != nil {
 		fmt.Printf("Lease   expires %s\n", task.LeaseExpiresAt.Local().Format(time.RFC3339))
+	}
+	if task.RunAfter != nil && task.RunAfter.After(time.Now()) {
+		fmt.Printf("Retry   held until %s (%s of backoff left)\n",
+			task.RunAfter.Local().Format(time.RFC3339),
+			time.Until(*task.RunAfter).Round(time.Second))
 	}
 	fmt.Printf("Created %s\n", task.CreatedAt.Local().Format(time.RFC3339))
 

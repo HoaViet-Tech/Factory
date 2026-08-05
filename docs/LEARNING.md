@@ -89,6 +89,10 @@ expired leases, and gives up after N attempts by marking the task `lost`.
   minutes forward instead of sleeping.
 - Requeuing forever. A task that crashes its worker three times will crash the
   fourth. Cap it.
+- Requeuing *instantly*. A rate limit or a network blip burns all three
+  attempts in five seconds and gives up, when waiting 30s would have worked.
+  Add a `run_after` column, set it when requeuing, and filter on it in the
+  claim query. Back off exponentially and cap it.
 - **Shipping expiry without renewal.** This one bit this repository. If the
   worker never renews, the reaper cannot tell a slow agent from a dead one, so
   any task outliving its lease is requeued and run a *second time* while the
@@ -246,9 +250,12 @@ point — FIFO alone would hand it the wrong one.
 - **Re-review after new commits.** Dedupe is per issue and workflow, so an issue
   gets one review. Include the PR head SHA in the key to review each push.
 - **Concurrency per worker.** One task at a time is a deliberate simplification.
-- **Retry backoff.** Three attempts fire back to back with no delay.
-- **Auth.** The API binds to localhost and trusts every caller. That has to
-  change before it is exposed.
+- **Worktree pruning.** Every task and retry leaves a checkout on disk. A
+  `prune --older-than 7d` that removes the directories and runs
+  `git worktree prune` is a short job.
+- **Auth.** The API trusts every caller, which is why it binds to loopback and
+  is reached over a tunnel. If you ever want it genuinely exposed, that needs
+  auth *and* TLS — not a token over plain HTTP.
 - **A real dashboard.** `GET /tasks` and `GET /tasks/{id}/events` are already
   enough to build one.
 

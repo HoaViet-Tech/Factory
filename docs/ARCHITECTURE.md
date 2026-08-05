@@ -70,6 +70,18 @@ the task, because it no longer owns it.
 Note the ordering guarantee: `RenewLease` goes through the same `checkLease`
 as completion, so a worker whose lease was already reaped cannot resurrect it.
 
+**Requeued tasks back off before they can be claimed again.** The reaper sets
+`run_after = now + RetryBackoff(attempt)` (30s, then 60s, capped at 10m), and
+the claim query skips anything still inside that window. Without it, a
+transient failure — a GitHub rate limit, a flaky network — burns all three
+attempts within seconds and lands in `lost`, when waiting would have worked.
+The backoff is deterministic rather than jittered: there is one control plane,
+so there is no thundering herd to scatter, and determinism makes it testable.
+
+Note that this applies to *expired leases* only. A task whose worker reports
+`failed` is terminal and is never retried: the worker got far enough to have an
+opinion, and repeating a deterministic failure helps nobody.
+
 ### Attempts are isolated, not just tasks
 
 A retry reuses the task ID, so branch and worktree names are scoped by
@@ -298,8 +310,8 @@ GitHub mutation, the label is checked live first.
 
 | Not built | Why |
 |---|---|
-| Auth on the API | It binds to 127.0.0.1; add auth before it ever leaves localhost |
+| Auth on the API | Deliberate: it binds to loopback and is reached over a tunnel. See "Remote access" in the README — an exposed port here is remote code execution |
 | Multi-node | `SetMaxOpenConns(1)` and a local file assume one machine |
 | Automatic merging | A human reviews. Always. |
 | Re-review after new commits | Dedupe is per issue+workflow; needs a head-SHA key |
-| Retry backoff | `MaxAttempts` is 3 with no delay between attempts |
+| Worktree cleanup | Every task and retry leaves a checkout on disk, on purpose |

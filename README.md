@@ -188,6 +188,8 @@ If the binary is missing, the worker refuses to start and tells you to use
   requeued, and after 3 attempts the task is marked `lost`. A working worker
   **renews** its lease on a timer, so a slow agent is never mistaken for a dead
   one and handed to a second worker.
+- **Retries back off** (30s, then 60s), so a rate limit or a network blip does
+  not burn every attempt in the same five seconds.
 - **Each attempt is isolated.** A retry gets its own branch and worktree
   (`factory/task-<id>-attempt-<n>`), so it never collides with the leftovers of
   the attempt that failed.
@@ -196,6 +198,46 @@ If the binary is missing, the worker refuses to start and tells you to use
   you mean it.
 - **Pushing is opt-in** (`--push`), and dry-run mode (`--github-dry-run`) logs
   every GitHub write instead of performing it.
+
+## Remote access
+
+**The API has no authentication, and it must not be exposed.**
+
+That is not an oversight to work around — it follows from what the API does.
+`POST /tasks` accepts an arbitrary prompt, and a worker feeds that prompt to an
+agent that edits files and can push with your GitHub credentials. Anyone who
+can reach the port can run code on your machine as you.
+
+So the control plane binds to `127.0.0.1`, and you reach it from elsewhere
+through a tunnel rather than by opening the port. The server prints a loud
+warning if you ever bind it to a non-loopback address.
+
+**SSH port forwarding** — nothing to install:
+
+```bash
+ssh -N -L 7337:127.0.0.1:7337 you@factory-host
+```
+
+The control plane is now at `http://127.0.0.1:7337` on your local machine, and
+every CLI command works unchanged.
+
+**Tailscale or another private network** — better if you want it always on.
+Bind the server to the private interface only, never to `0.0.0.0`:
+
+```bash
+./codefactory server --listen 100.x.y.z:7337
+```
+
+That address is reachable only inside your tailnet. The startup warning will
+still fire, because the code cannot tell a tailnet address from a public one —
+in this case it is telling you to be sure, not that you are wrong.
+
+Rules of thumb:
+
+- Never `--listen 0.0.0.0:7337`, and never port-forward 7337 on a router.
+- Run workers on the same host as the repositories they build.
+- If you ever do need real exposure, put a reverse proxy with TLS **and**
+  authentication in front of it. A bearer token over plain HTTP is not enough.
 
 ## API
 

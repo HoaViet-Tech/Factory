@@ -337,6 +337,15 @@ func TestExpiredLeaseIsRequeuedThenLost(t *testing.T) {
 		if got.Status != want {
 			t.Fatalf("after attempt %d status = %q, want %q", attempt, got.Status, want)
 		}
+
+		if want == api.StatusQueued {
+			// The retry is held back by the backoff, so wait it out before the
+			// next attempt.
+			if got.RunAfter == nil {
+				t.Fatalf("after attempt %d the task should have a run_after", attempt)
+			}
+			now = got.RunAfter.Add(time.Second)
+		}
 	}
 
 	// A lost task is terminal, so nothing claims it again.
@@ -420,6 +429,103 @@ func TestRenewLeaseRejectsNonOwners(t *testing.T) {
 	}
 	if _, err := st.RenewLease(created.ID, token, time.Minute); !errors.Is(err, ErrNotRunning) {
 		t.Errorf("renewing a reaped task returned %v, want ErrNotRunning", err)
+	}
+}
+
+// TestRetryBackoffHoldsTheTaskBack covers the transient-failure case: a rate
+// limit or network blip must not burn every attempt within seconds.
+func TestRetryBackoffHoldsTheTaskBack(t *testing.T) {
+	st := newTestStore(t)
+	worker := mustRegisterWorker(t, st)
+	created := mustCreateTask(t, st, "transiently failing task")
+
+	now := time.Now().UTC()
+	st.SetClock(func() time.Time { return now })
+
+	if _, _, err := st.ClaimTask(worker.ID, time.Minute, nil); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	// The worker dies and the lease expires.
+	now = now.Add(2 * time.Minute)
+	if _, err := st.ReapExpiredLeases(); err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+
+	got, err := st.GetTask(created.ID)
+	if err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	if got.Status != api.StatusQueued {
+		t.Fatalf("status = %q, want queued", got.Status)
+	}
+	if got.RunAfter == nil {
+		t.Fatal("a requeued task should carry a run_after")
+	}
+
+	wantDelay := RetryBackoff(1)
+	if gotDelay := got.RunAfter.Sub(now); gotDelay != wantDelay {
+		t.Errorf("backoff = %s, want %s", gotDelay, wantDelay)
+	}
+
+	// Still inside the backoff window: the task exists and is queued, but no
+	// worker may claim it yet.
+	if _, _, err := st.ClaimTask(worker.ID, time.Minute, nil); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("claim during backoff returned %v, want ErrNotFound", err)
+	}
+	now = got.RunAfter.Add(-time.Second)
+	if _, _, err := st.ClaimTask(worker.ID, time.Minute, nil); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("claim one second before run_after returned %v, want ErrNotFound", err)
+	}
+
+	// Once the window passes it is claimable again.
+	now = got.RunAfter.Add(time.Second)
+	claimed, _, err := st.ClaimTask(worker.ID, time.Minute, nil)
+	if err != nil {
+		t.Fatalf("claim after backoff: %v", err)
+	}
+	if claimed.ID != created.ID {
+		t.Fatalf("claimed %s, want %s", claimed.ID, created.ID)
+	}
+	if claimed.AttemptCount != 2 {
+		t.Errorf("attempt count = %d, want 2", claimed.AttemptCount)
+	}
+}
+
+func TestRetryBackoffGrows(t *testing.T) {
+	first := RetryBackoff(1)
+	second := RetryBackoff(2)
+	third := RetryBackoff(3)
+
+	if !(first < second && second < third) {
+		t.Errorf("backoff should grow: %s, %s, %s", first, second, third)
+	}
+	if first != 30*time.Second {
+		t.Errorf("first backoff = %s, want 30s", first)
+	}
+
+	// It must be bounded, including for absurd attempt counts that would
+	// otherwise overflow the shift.
+	for _, attempt := range []int{0, -1, 20, 64, 1000} {
+		d := RetryBackoff(attempt)
+		if d <= 0 || d > 10*time.Minute {
+			t.Errorf("RetryBackoff(%d) = %s, want a positive value capped at 10m", attempt, d)
+		}
+	}
+}
+
+// A brand new task must be claimable immediately; backoff applies only to
+// retries.
+func TestNewTaskHasNoBackoff(t *testing.T) {
+	st := newTestStore(t)
+	worker := mustRegisterWorker(t, st)
+	created := mustCreateTask(t, st, "fresh task")
+
+	if created.RunAfter != nil {
+		t.Errorf("a new task should have no run_after, got %v", created.RunAfter)
+	}
+	if _, _, err := st.ClaimTask(worker.ID, time.Minute, nil); err != nil {
+		t.Fatalf("a new task should be claimable immediately: %v", err)
 	}
 }
 

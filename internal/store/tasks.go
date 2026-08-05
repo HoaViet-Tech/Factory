@@ -16,8 +16,29 @@ import (
 const MaxAttempts = 3
 
 const taskColumns = `id, kind, status, repo_owner, repo_name, github_issue_number,
-	title, prompt, worker_id, lease_token, lease_expires_at, attempt_count,
+	title, prompt, worker_id, lease_token, lease_expires_at, run_after, attempt_count,
 	created_at, updated_at`
+
+// RetryBackoff is how long a requeued task waits before it can be claimed
+// again.
+//
+// The point is transient failures: a rate limit or a network blip should not
+// burn every attempt in the same five seconds. It is deterministic (no jitter)
+// because there is one control plane, so there is no thundering herd to
+// scatter — and determinism makes it testable.
+func RetryBackoff(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	const base = 30 * time.Second
+	const max = 10 * time.Minute
+
+	d := base << (attempt - 1) // 30s, 60s, 120s, ...
+	if d > max || d <= 0 {     // d <= 0 guards against shift overflow
+		return max
+	}
+	return d
+}
 
 // scanTask reads one task row. Works with both *sql.Row and *sql.Rows.
 func scanTask(sc interface{ Scan(...any) error }) (api.Task, error) {
@@ -27,12 +48,13 @@ func scanTask(sc interface{ Scan(...any) error }) (api.Task, error) {
 		workerID  sql.NullString
 		leaseTok  sql.NullString
 		leaseExp  sql.NullString
+		runAfter  sql.NullString
 		createdAt string
 		updatedAt string
 	)
 	err := sc.Scan(
 		&t.ID, &t.Kind, &t.Status, &t.RepoOwner, &t.RepoName, &issueNum,
-		&t.Title, &t.Prompt, &workerID, &leaseTok, &leaseExp, &t.AttemptCount,
+		&t.Title, &t.Prompt, &workerID, &leaseTok, &leaseExp, &runAfter, &t.AttemptCount,
 		&createdAt, &updatedAt,
 	)
 	if err != nil {
@@ -42,6 +64,7 @@ func scanTask(sc interface{ Scan(...any) error }) (api.Task, error) {
 	t.WorkerID = nullString(workerID)
 	t.LeaseToken = nullString(leaseTok)
 	t.LeaseExpiresAt = nullTime(leaseExp)
+	t.RunAfter = nullTime(runAfter)
 	t.CreatedAt = mustParseTime(createdAt)
 	t.UpdatedAt = mustParseTime(updatedAt)
 	return t, nil
@@ -95,9 +118,10 @@ func (s *Store) createTaskTx(tx *sql.Tx, req api.CreateTaskRequest) (api.Task, e
 		UpdatedAt:         now,
 	}
 
+	// A new task is claimable immediately: run_after is left empty.
 	_, err := tx.Exec(`
 INSERT INTO tasks (`+taskColumns+`)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0, ?, ?)`,
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, '', 0, ?, ?)`,
 		t.ID, t.Kind, t.Status, t.RepoOwner, t.RepoName, intOrNil(t.GitHubIssueNumber),
 		t.Title, t.Prompt, formatTime(t.CreatedAt), formatTime(t.UpdatedAt))
 	if err != nil {
@@ -203,9 +227,11 @@ func (s *Store) ClaimTask(workerID string, leaseFor time.Duration, kinds []strin
 	}
 	defer tx.Rollback()
 
-	// Oldest matching queued task first: a plain FIFO queue, per kind filter.
-	query := `SELECT ` + taskColumns + ` FROM tasks WHERE status = ?`
-	args := []any{api.StatusQueued}
+	// Oldest matching queued task first: a plain FIFO queue, per kind filter,
+	// skipping anything still serving its retry backoff.
+	query := `SELECT ` + taskColumns + ` FROM tasks
+		WHERE status = ? AND (run_after = '' OR run_after <= ?)`
+	args := []any{api.StatusQueued, formatTime(s.Now())}
 	if len(kinds) > 0 {
 		query += ` AND kind IN (?` + strings.Repeat(`, ?`, len(kinds)-1) + `)`
 		for _, k := range kinds {
@@ -450,16 +476,24 @@ func (s *Store) ReapExpiredLeases() ([]ReapedTask, error) {
 	var reaped []ReapedTask
 	for _, t := range expired {
 		newStatus := api.StatusQueued
-		msg := fmt.Sprintf("lease expired after attempt %d; requeued", t.AttemptCount)
+		runAfter := ""
+		msg := ""
+
 		if t.AttemptCount >= MaxAttempts {
 			newStatus = api.StatusLost
 			msg = fmt.Sprintf("lease expired after attempt %d; giving up (max %d attempts)", t.AttemptCount, MaxAttempts)
+		} else {
+			// Back off before the next attempt, so a transient failure does
+			// not burn every attempt in the same few seconds.
+			delay := RetryBackoff(t.AttemptCount)
+			runAfter = formatTime(now.Add(delay))
+			msg = fmt.Sprintf("lease expired after attempt %d; retrying in %s", t.AttemptCount, delay)
 		}
 
 		if _, err := tx.Exec(`UPDATE tasks
 			SET status = ?, worker_id = NULL, lease_token = NULL,
-			    lease_expires_at = NULL, updated_at = ?
-			WHERE id = ?`, newStatus, formatTime(now), t.ID); err != nil {
+			    lease_expires_at = NULL, run_after = ?, updated_at = ?
+			WHERE id = ?`, newStatus, runAfter, formatTime(now), t.ID); err != nil {
 			return nil, err
 		}
 		if err := appendEventTx(tx, now, t.ID, api.EventWarn, msg); err != nil {

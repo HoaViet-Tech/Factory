@@ -82,6 +82,16 @@ CREATE TABLE github_observations (
 ALTER TABLE workers ADD COLUMN kinds TEXT NOT NULL DEFAULT '';
 `,
 	},
+	{
+		// Requeued tasks wait before becoming claimable again. Without this a
+		// transient failure (a GitHub rate limit, a network blip) burns every
+		// attempt within seconds and gives up, when waiting would have worked.
+		// Empty means "claimable immediately", which is right for new tasks.
+		Name: "0003_task_run_after",
+		SQL: `
+ALTER TABLE tasks ADD COLUMN run_after TEXT NOT NULL DEFAULT '';
+`,
+	},
 }
 
 // migrate creates schema_migrations if needed and applies anything missing.

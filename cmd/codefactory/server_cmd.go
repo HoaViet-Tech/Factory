@@ -5,8 +5,10 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -63,8 +65,49 @@ func runServer(args []string) error {
 		Logger:       logger,
 	})
 
+	warnIfExposed(logger, *listen)
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	return srv.Run(ctx, *listen)
+}
+
+// warnIfExposed shouts when the control plane is bound to anything other than
+// loopback.
+//
+// There is no authentication on this API, and POST /tasks runs an arbitrary
+// prompt through an agent that edits files and can push with your GitHub
+// credentials. On loopback that is fine. On a routable interface it is remote
+// code execution for anyone who can reach the port. Reach a remote control
+// plane through an SSH tunnel or a private network instead — see the README.
+func warnIfExposed(logger *log.Logger, listen string) {
+	host, _, err := net.SplitHostPort(listen)
+	if err != nil {
+		host = listen
+	}
+	if isLoopback(host) {
+		return
+	}
+
+	logger.Printf("**********************************************************************")
+	logger.Printf("WARNING: listening on %q, which is not loopback.", listen)
+	logger.Printf("")
+	logger.Printf("This API has NO AUTHENTICATION. Anyone who can reach this port can")
+	logger.Printf("queue a task, which runs an agent on this machine with your git and")
+	logger.Printf("GitHub credentials. That is remote code execution.")
+	logger.Printf("")
+	logger.Printf("Bind to 127.0.0.1 and reach it over an SSH tunnel or a private")
+	logger.Printf("network instead. See \"Remote access\" in the README.")
+	logger.Printf("**********************************************************************")
+}
+
+func isLoopback(host string) bool {
+	switch host {
+	case "", "localhost":
+		// An empty host means "all interfaces", which is the worst case.
+		return host == "localhost"
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
 }

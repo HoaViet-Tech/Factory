@@ -123,9 +123,13 @@ type Task struct {
 	WorkerID          *string    `json:"worker_id,omitempty"`
 	LeaseToken        *string    `json:"lease_token,omitempty"`
 	LeaseExpiresAt    *time.Time `json:"lease_expires_at,omitempty"`
-	AttemptCount      int        `json:"attempt_count"`
-	CreatedAt         time.Time  `json:"created_at"`
-	UpdatedAt         time.Time  `json:"updated_at"`
+	// RunAfter holds a queued task back until this time. It is set when a
+	// failed attempt is requeued, so retries back off instead of firing
+	// immediately. Nil means claimable now.
+	RunAfter     *time.Time `json:"run_after,omitempty"`
+	AttemptCount int        `json:"attempt_count"`
+	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
 }
 
 // FullName returns "owner/name" for the task's repository.
