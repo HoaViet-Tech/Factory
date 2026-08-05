@@ -63,6 +63,16 @@ func ExtractUntrusted(promptText string) (string, bool) {
 	return strings.TrimSpace(block), true
 }
 
+// ExtractDiff pulls the unified diff back out of a review prompt.
+func ExtractDiff(promptText string) (string, bool) {
+	marker := "\n## The diff under review\n"
+	i := strings.Index(promptText, marker)
+	if i < 0 {
+		return "", false
+	}
+	return ExtractUntrusted(promptText[i:])
+}
+
 // RefinedTicketTemplate is the exact structure a refiner must produce. Keeping
 // it as one constant means the refiner, the docs and the tests never drift.
 const RefinedTicketTemplate = `## Goal
@@ -156,6 +166,126 @@ func ForImplement(iss IssueContext) string {
 	b.WriteString(WrapUntrusted(fmt.Sprintf("%s#%d by @%s", iss.Repo, iss.Number, iss.Author),
 		"Title: "+iss.Title+"\n\n"+iss.Body))
 	return b.String()
+}
+
+// Review verdicts. A reviewer must start its verdict section with one of
+// these, which is what the worker keys the label transition off.
+const (
+	VerdictApprove        = "APPROVE"
+	VerdictRequestChanges = "REQUEST_CHANGES"
+	VerdictComment        = "COMMENT"
+)
+
+// ReviewTemplate is the structure a reviewing agent must produce.
+const ReviewTemplate = `## Verdict
+
+APPROVE | REQUEST_CHANGES | COMMENT
+
+## Summary
+
+## Blocking Issues
+
+## Non-blocking Suggestions
+
+## Test Coverage
+`
+
+// ReviewHeadings lists the required review headings, in order.
+func ReviewHeadings() []string {
+	return []string{
+		"## Verdict",
+		"## Summary",
+		"## Blocking Issues",
+		"## Non-blocking Suggestions",
+		"## Test Coverage",
+	}
+}
+
+// PRContext is the pull request under review.
+type PRContext struct {
+	Number      int
+	Title       string
+	Body        string
+	URL         string
+	HeadRefName string
+	BaseRefName string
+}
+
+// ForReview builds the prompt for a review_pr task.
+//
+// The diff is fetched at execution time and appended by the worker, because it
+// does not exist yet when the poller creates the task.
+func ForReview(iss IssueContext, pr PRContext) string {
+	var b strings.Builder
+	b.WriteString("# Task: review a pull request\n\n")
+	fmt.Fprintf(&b, "Repository: %s\nPull request: #%d (%s -> %s)\nURL: %s\nOriginal issue: #%d\n\n",
+		iss.Repo, pr.Number, pr.HeadRefName, pr.BaseRefName, pr.URL, iss.Number)
+
+	b.WriteString("## What to do\n\n")
+	b.WriteString("You are reviewing code written by another agent. Read the diff and the\n")
+	b.WriteString("surrounding code in this worktree, which is checked out at the PR's head.\n\n")
+	b.WriteString("Judge three things, in this order:\n")
+	b.WriteString("1. Does it actually do what the ticket asked?\n")
+	b.WriteString("2. Is it correct — edge cases, error handling, concurrency, resource leaks?\n")
+	b.WriteString("3. Is it tested? A change with no test is a finding, not a nitpick.\n\n")
+	b.WriteString("Write the review to `.factory-review.md` in the working directory.\n\n")
+
+	b.WriteString("## Rules\n\n")
+	b.WriteString("- Do not change any files. This is a read-only task.\n")
+	b.WriteString("- Report only what you can point at in the diff or the code. Do not speculate.\n")
+	b.WriteString("- Say REQUEST_CHANGES only for something that is actually wrong, not for style.\n")
+	b.WriteString("- If you find nothing blocking, say so plainly rather than inventing findings.\n\n")
+
+	b.WriteString("## Required output format\n\n```markdown\n")
+	b.WriteString(ReviewTemplate)
+	b.WriteString("```\n\n")
+
+	b.WriteString("## The original request\n\n")
+	b.WriteString(WrapUntrusted(fmt.Sprintf("%s#%d by @%s", iss.Repo, iss.Number, iss.Author),
+		"Title: "+iss.Title+"\n\n"+iss.Body))
+
+	b.WriteString("\n## The pull request description\n\n")
+	b.WriteString(WrapUntrusted(fmt.Sprintf("%s PR #%d", iss.Repo, pr.Number),
+		"Title: "+pr.Title+"\n\n"+pr.Body))
+	return b.String()
+}
+
+// WithDiff appends the live diff to a review prompt.
+func WithDiff(promptText, diff string) string {
+	var b strings.Builder
+	b.WriteString(promptText)
+	b.WriteString("\n## The diff under review\n\n")
+	b.WriteString(WrapUntrusted("unified diff", diff))
+	return b.String()
+}
+
+// ParseVerdict extracts the verdict from a review document.
+//
+// It defaults to COMMENT: an unparseable review must never be treated as an
+// approval.
+func ParseVerdict(review string) string {
+	upper := strings.ToUpper(review)
+
+	// Look inside the Verdict section first, so the word "APPROVE" appearing
+	// in prose further down cannot change the outcome.
+	if i := strings.Index(upper, "## VERDICT"); i >= 0 {
+		section := upper[i+len("## VERDICT"):]
+		if j := strings.Index(section, "\n##"); j >= 0 {
+			section = section[:j]
+		}
+		switch {
+		case strings.Contains(section, VerdictRequestChanges):
+			return VerdictRequestChanges
+		case strings.Contains(section, VerdictApprove):
+			return VerdictApprove
+		}
+		return VerdictComment
+	}
+
+	if strings.Contains(upper, VerdictRequestChanges) {
+		return VerdictRequestChanges
+	}
+	return VerdictComment
 }
 
 // LooksAmbiguous is the deterministic "is this too vague?" heuristic used by

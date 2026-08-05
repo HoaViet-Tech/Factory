@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	"github.com/HoaViet-Tech/factory/internal/api"
+	"github.com/HoaViet-Tech/factory/internal/prompt"
 )
 
 // CommandRuntime shells out to a real coding agent CLI.
@@ -132,6 +133,20 @@ func (c *CommandRuntime) Run(rc RunContext) (Result, error) {
 	}
 
 	res := Result{Summary: fmt.Sprintf("%s runtime finished", c.RuntimeName)}
+
+	// A review task must leave a review behind. An agent that produced nothing
+	// must not be reported as a clean review.
+	if rc.Task.Kind == api.KindReviewPR {
+		data, readErr := os.ReadFile(filepath.Join(rc.WorktreeDir, ".factory-review.md"))
+		if readErr != nil || strings.TrimSpace(string(data)) == "" {
+			return Result{}, fmt.Errorf(
+				"the agent did not write .factory-review.md, so there is no review to publish")
+		}
+		res.Review = string(data)
+		res.Verdict = prompt.ParseVerdict(res.Review)
+		res.Summary = fmt.Sprintf("%s runtime reviewed the PR: %s", c.RuntimeName, res.Verdict)
+		return res, nil
+	}
 
 	// A refine task must leave the structured ticket behind. If the agent did
 	// not produce one, that is a needs-human outcome rather than a crash.

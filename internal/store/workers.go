@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -27,6 +28,13 @@ func (s *Store) RegisterWorker(req api.RegisterWorkerRequest) (api.Worker, error
 		return api.Worker{}, errors.New("runtime is required")
 	}
 
+	for _, k := range req.Kinds {
+		if !api.IsValidKind(k) {
+			return api.Worker{}, fmt.Errorf("invalid task kind %q (valid: %s)",
+				k, strings.Join(api.ValidKinds(), ", "))
+		}
+	}
+
 	id := req.ID
 	if id == "" {
 		id = idgen.WorkerID()
@@ -34,14 +42,15 @@ func (s *Store) RegisterWorker(req api.RegisterWorkerRequest) (api.Worker, error
 	now := s.Now()
 
 	_, err := s.db.Exec(`
-INSERT INTO workers (id, name, runtime, last_seen_at, status, created_at)
-VALUES (?, ?, ?, ?, ?, ?)
+INSERT INTO workers (id, name, runtime, kinds, last_seen_at, status, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (id) DO UPDATE SET
     name = excluded.name,
     runtime = excluded.runtime,
+    kinds = excluded.kinds,
     last_seen_at = excluded.last_seen_at,
     status = excluded.status`,
-		id, req.Name, req.Runtime, formatTime(now), api.WorkerActive, formatTime(now))
+		id, req.Name, req.Runtime, encodeKinds(req.Kinds), formatTime(now), api.WorkerActive, formatTime(now))
 	if err != nil {
 		return api.Worker{}, err
 	}
@@ -68,7 +77,7 @@ func (s *Store) Heartbeat(workerID string) (api.Worker, error) {
 
 // GetWorker loads a worker by ID.
 func (s *Store) GetWorker(id string) (api.Worker, error) {
-	row := s.db.QueryRow(`SELECT id, name, runtime, last_seen_at, status, created_at
+	row := s.db.QueryRow(`SELECT id, name, runtime, kinds, last_seen_at, status, created_at
 	                      FROM workers WHERE id = ?`, id)
 	w, err := s.scanWorker(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -79,7 +88,7 @@ func (s *Store) GetWorker(id string) (api.Worker, error) {
 
 // ListWorkers returns every registered worker, most recently seen first.
 func (s *Store) ListWorkers() ([]api.Worker, error) {
-	rows, err := s.db.Query(`SELECT id, name, runtime, last_seen_at, status, created_at
+	rows, err := s.db.Query(`SELECT id, name, runtime, kinds, last_seen_at, status, created_at
 	                         FROM workers ORDER BY last_seen_at DESC`)
 	if err != nil {
 		return nil, err
@@ -97,15 +106,36 @@ func (s *Store) ListWorkers() ([]api.Worker, error) {
 	return workers, rows.Err()
 }
 
+// encodeKinds stores the kind list as a comma-separated string. A dedicated
+// table would be tidier, but this stays readable in a SQLite browser and the
+// list has at most four entries.
+func encodeKinds(kinds []string) string { return strings.Join(kinds, ",") }
+
+func decodeKinds(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 func (s *Store) scanWorker(sc interface{ Scan(...any) error }) (api.Worker, error) {
 	var (
 		w          api.Worker
+		kinds      string
 		lastSeenAt string
 		createdAt  string
 	)
-	if err := sc.Scan(&w.ID, &w.Name, &w.Runtime, &lastSeenAt, &w.Status, &createdAt); err != nil {
+	if err := sc.Scan(&w.ID, &w.Name, &w.Runtime, &kinds, &lastSeenAt, &w.Status, &createdAt); err != nil {
 		return api.Worker{}, err
 	}
+	w.Kinds = decodeKinds(kinds)
 	w.LastSeenAt = mustParseTime(lastSeenAt)
 	w.CreatedAt = mustParseTime(createdAt)
 

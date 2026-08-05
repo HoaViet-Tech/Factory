@@ -8,6 +8,7 @@ import (
 	"github.com/HoaViet-Tech/factory/internal/githubcli"
 	"github.com/HoaViet-Tech/factory/internal/gitx"
 	"github.com/HoaViet-Tech/factory/internal/labels"
+	"github.com/HoaViet-Tech/factory/internal/prompt"
 )
 
 // requiredLabel is the label an issue must still carry for a given task kind.
@@ -17,6 +18,8 @@ func requiredLabel(kind string) string {
 		return labels.Inbox
 	case api.KindImplementTicket:
 		return labels.Ready
+	case api.KindReviewPR:
+		return labels.Review
 	default:
 		return ""
 	}
@@ -181,6 +184,99 @@ func (w *Worker) publishImplementation(task api.Task, iss githubcli.Issue, wt *g
 		return fmt.Errorf("comment PR link: %w", err)
 	}
 	return w.cfg.GitHub.SetLabels(repo, number, []string{labels.Review}, []string{labels.Active})
+}
+
+// resolvePRForReview finds the open PR a review task should look at.
+//
+// It returns a skip message rather than an error when there is simply nothing
+// to review yet: that is a normal state, not a failure.
+func (w *Worker) resolvePRForReview(task api.Task, issue *githubcli.Issue, logf func(string, string, ...any)) (*githubcli.PullRequest, string, error) {
+	if issue == nil || w.cfg.GitHub == nil {
+		return nil, "", fmt.Errorf("review tasks need GitHub access; run the worker with an authenticated gh")
+	}
+
+	repo := task.FullName()
+	pr, err := w.cfg.GitHub.FindPRForIssue(repo, issue.Number)
+	if err != nil {
+		return nil, "", fmt.Errorf("find PR for issue #%d: %w", issue.Number, err)
+	}
+	if pr == nil {
+		msg := fmt.Sprintf("no open pull request references %s#%d yet; nothing to review", repo, issue.Number)
+		logf(api.EventGitHub, "%s", msg)
+		return nil, msg, nil
+	}
+
+	logf(api.EventGitHub, "reviewing PR #%d (%s -> %s): %s",
+		pr.Number, pr.HeadRefName, pr.BaseRefName, pr.URL)
+	return pr, "", nil
+}
+
+// buildReviewPrompt rebuilds the review prompt with the PR that was actually
+// found, replacing the placeholder the poller created.
+func buildReviewPrompt(task api.Task, issue *githubcli.Issue, pr *githubcli.PullRequest) string {
+	return prompt.ForReview(
+		prompt.IssueContext{
+			Repo:   task.FullName(),
+			Number: issue.Number,
+			Title:  issue.Title,
+			Body:   issue.Body,
+			Author: issue.Author,
+			URL:    issue.URL,
+		},
+		prompt.PRContext{
+			Number:      pr.Number,
+			Title:       pr.Title,
+			Body:        pr.Body,
+			URL:         pr.URL,
+			HeadRefName: pr.HeadRefName,
+			BaseRefName: pr.BaseRefName,
+		},
+	)
+}
+
+// publishReview posts the review on the pull request and moves the issue's
+// label according to the verdict.
+//
+// The review is posted as a plain comment, never as a GitHub review approval:
+// an agent must not be able to satisfy a human approval requirement on a
+// protected branch.
+func (w *Worker) publishReview(task api.Task, iss githubcli.Issue, pr githubcli.PullRequest, result runtimeResult, logf func(string, string, ...any)) error {
+	repo := task.FullName()
+
+	body := result.Review
+	if strings.TrimSpace(body) == "" {
+		body = "_The runtime produced no review document._"
+	}
+
+	verdict := result.Verdict
+	if verdict == "" {
+		verdict = prompt.ParseVerdict(body)
+	}
+
+	header := map[string]string{
+		prompt.VerdictApprove:        "🏭 **Automated review: no blocking issues found.** A human still needs to approve and merge.",
+		prompt.VerdictRequestChanges: "🏭 **Automated review: changes requested.**",
+		prompt.VerdictComment:        "🏭 **Automated review.**",
+	}[verdict]
+
+	comment := fmt.Sprintf("%s\n\n%s\n\n---\n<sub>factory task `%s` · runtime `%s` · verdict `%s`</sub>\n",
+		header, body, task.ID, w.cfg.Runtime.Name(), verdict)
+
+	if err := w.cfg.GitHub.CommentOnPR(repo, pr.Number, comment); err != nil {
+		return fmt.Errorf("comment review on PR #%d: %w", pr.Number, err)
+	}
+	logf(api.EventGitHub, "posted review on PR #%d (verdict %s)", pr.Number, verdict)
+
+	// Only a REQUEST_CHANGES moves the issue, and it moves it to blocked so a
+	// human notices. A clean review deliberately leaves the issue in
+	// factory:review, because merging is a human decision either way.
+	if verdict == prompt.VerdictRequestChanges {
+		if err := w.cfg.GitHub.SetLabels(repo, iss.Number, []string{labels.Blocked}, []string{labels.Review}); err != nil {
+			return fmt.Errorf("update labels: %w", err)
+		}
+		logf(api.EventGitHub, "labels on %s#%d: +%s -%s", repo, iss.Number, labels.Blocked, labels.Review)
+	}
+	return nil
 }
 
 func reasonSuffix(reason string) string {

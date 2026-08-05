@@ -69,6 +69,75 @@ func TestForRefineIncludesTemplateAndIssue(t *testing.T) {
 	}
 }
 
+func TestParseVerdict(t *testing.T) {
+	cases := []struct {
+		name, review, want string
+	}{
+		{"approve", "## Verdict\n\nAPPROVE\n\n## Summary\n\nLooks good.", VerdictApprove},
+		{"request changes", "## Verdict\n\nREQUEST_CHANGES\n\n## Summary\n\nBroken.", VerdictRequestChanges},
+		{"comment", "## Verdict\n\nCOMMENT\n\n## Summary\n\nSome notes.", VerdictComment},
+		{
+			// The word APPROVE appearing in prose must not flip the verdict.
+			"approve mentioned in prose only",
+			"## Verdict\n\nREQUEST_CHANGES\n\n## Summary\n\nI would APPROVE this once the leak is fixed.",
+			VerdictRequestChanges,
+		},
+		{
+			"prose approval without a verdict section",
+			"I would APPROVE this change, it looks fine to me.",
+			VerdictComment,
+		},
+		{"empty", "", VerdictComment},
+		{"garbage", "the runtime crashed halfway through", VerdictComment},
+	}
+
+	for _, c := range cases {
+		if got := ParseVerdict(c.review); got != c.want {
+			t.Errorf("%s: ParseVerdict = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// An unparseable review must never read as an approval, because the verdict
+// drives a label transition on a real issue.
+func TestParseVerdictFailsClosed(t *testing.T) {
+	for _, review := range []string{"", "   ", "## Verdict\n\n\n", "unexpected output"} {
+		if got := ParseVerdict(review); got == VerdictApprove {
+			t.Errorf("ParseVerdict(%q) = APPROVE; it must fail closed", review)
+		}
+	}
+}
+
+func TestForReviewAndExtractDiff(t *testing.T) {
+	diff := "diff --git a/x.go b/x.go\n+added line\n"
+	p := WithDiff(ForReview(
+		IssueContext{Repo: "local/demo", Number: 3, Title: "Fix it", Body: "It should not crash."},
+		PRContext{Number: 9, Title: "Fix it", HeadRefName: "factory/task-a-attempt-1", BaseRefName: "main"},
+	), diff)
+
+	for _, heading := range ReviewHeadings() {
+		if !strings.Contains(p, heading) {
+			t.Errorf("review prompt is missing the %q heading", heading)
+		}
+	}
+	if !strings.Contains(p, "Do not change any files") {
+		t.Error("the review prompt must say the task is read-only")
+	}
+
+	got, ok := ExtractDiff(p)
+	if !ok {
+		t.Fatal("ExtractDiff did not find the diff")
+	}
+	if !strings.Contains(got, "+added line") {
+		t.Errorf("extracted diff = %q", got)
+	}
+
+	// The diff is third-party content too, so it must be fenced.
+	if strings.Count(p, untrustedOpen) < 3 {
+		t.Error("issue body, PR body and diff should each be fenced as untrusted")
+	}
+}
+
 func TestLooksAmbiguous(t *testing.T) {
 	vague := []struct{ title, body string }{
 		{"fix it", "broken"},

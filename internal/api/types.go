@@ -70,12 +70,30 @@ func IsTerminal(status string) bool {
 
 // Worker is one worker process identity. One worker owns one runtime.
 type Worker struct {
-	ID         string    `json:"id"`
-	Name       string    `json:"name"`
-	Runtime    string    `json:"runtime"`
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Runtime string `json:"runtime"`
+	// Kinds are the task kinds this worker will accept. Empty means all of
+	// them, which is what a single general-purpose worker wants. Setting it is
+	// how you build a pipeline: a cheap model on refine_ticket, a strong one on
+	// implement_ticket, a different one again on review_pr.
+	Kinds      []string  `json:"kinds,omitempty"`
 	LastSeenAt time.Time `json:"last_seen_at"`
 	Status     string    `json:"status"`
 	CreatedAt  time.Time `json:"created_at"`
+}
+
+// HandlesKind reports whether this worker accepts the given task kind.
+func (w Worker) HandlesKind(kind string) bool {
+	if len(w.Kinds) == 0 {
+		return true
+	}
+	for _, k := range w.Kinds {
+		if k == kind {
+			return true
+		}
+	}
+	return false
 }
 
 // Repository is a git repository the factory is allowed to work on.
@@ -163,6 +181,8 @@ type RegisterWorkerRequest struct {
 	ID      string `json:"id,omitempty"`
 	Name    string `json:"name"`
 	Runtime string `json:"runtime"`
+	// Kinds restricts which task kinds this worker accepts. Empty means all.
+	Kinds []string `json:"kinds,omitempty"`
 }
 
 // HeartbeatRequest is the body of POST /workers/heartbeat.
@@ -175,6 +195,9 @@ type ClaimRequest struct {
 	WorkerID string `json:"worker_id"`
 	// LeaseSeconds is optional; the server applies a default when it is zero.
 	LeaseSeconds int `json:"lease_seconds,omitempty"`
+	// Kinds restricts the claim to these task kinds. Empty means "anything",
+	// and the server falls back to the kinds recorded at registration.
+	Kinds []string `json:"kinds,omitempty"`
 }
 
 // ClaimResponse is returned by POST /tasks/claim when a task was claimed.

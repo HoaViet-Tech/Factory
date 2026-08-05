@@ -157,18 +157,26 @@ func (c *Client) RegisterWorker(req api.RegisterWorkerRequest) (api.Worker, erro
 	return out, err
 }
 
+// ListWorkers returns every registered worker and the kinds it handles.
+func (c *Client) ListWorkers() ([]api.Worker, error) {
+	var out []api.Worker
+	_, err := c.do(http.MethodGet, "/workers", nil, &out)
+	return out, err
+}
+
 // Heartbeat tells the server this worker is still alive.
 func (c *Client) Heartbeat(workerID string) error {
 	_, err := c.do(http.MethodPost, "/workers/heartbeat", api.HeartbeatRequest{WorkerID: workerID}, nil)
 	return err
 }
 
-// Claim attempts to claim one task. It returns ErrNoTask when the queue is
-// empty, which is the normal case and not a failure.
-func (c *Client) Claim(workerID string, leaseSeconds int) (api.Task, string, error) {
+// Claim attempts to claim one task of any of the given kinds (empty means
+// any). It returns ErrNoTask when nothing matches, which is the normal case
+// and not a failure.
+func (c *Client) Claim(workerID string, leaseSeconds int, kinds []string) (api.Task, string, error) {
 	var out api.ClaimResponse
 	code, err := c.do(http.MethodPost, "/tasks/claim",
-		api.ClaimRequest{WorkerID: workerID, LeaseSeconds: leaseSeconds}, &out)
+		api.ClaimRequest{WorkerID: workerID, LeaseSeconds: leaseSeconds, Kinds: kinds}, &out)
 	if err != nil {
 		return api.Task{}, "", err
 	}

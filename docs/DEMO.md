@@ -264,6 +264,83 @@ If the CLI's flags differ from the built-in template, override it:
 
 ---
 
+---
+
+## Demo 3: routing, with three workers
+
+Still no credentials. This shows that each worker only takes its own stage.
+
+Queue an implement task **first**, then a refine task — so FIFO order alone
+would give the refiner the wrong one:
+
+```bash
+./codefactory task create --repo local/demo --kind implement_ticket --title "Implement search" --prompt "Add search. It should return ranked results."
+```
+
+```bash
+./codefactory task create --repo local/demo --kind refine_ticket --title "Refine: search is slow" --prompt "Title: search is slow
+
+When I search for a long phrase the page should respond within a second but it hangs."
+```
+
+Run a refiner that only accepts `refine_ticket`:
+
+```bash
+./codefactory worker --name refiner --runtime fake --kinds refine_ticket --work-dir .factory-refiner --once
+```
+
+```
+[worker] registered as 3d8d0f069691cf73 (name=refiner runtime=fake handles=refine_ticket)
+[worker] claimed task bf9974abb797 (refine_ticket) "Refine: search is slow"
+[worker] task bf9974abb797 -> succeeded
+```
+
+It skipped the older implement task. Now a reviewer, which should find nothing
+even though a task is sitting in the queue:
+
+```bash
+./codefactory worker --name reviewer --runtime fake --kinds review_pr --work-dir .factory-reviewer --once
+```
+
+```
+[worker] registered as 85747d027487ba5c (name=reviewer runtime=fake handles=review_pr)
+[worker] queue empty and --once set; exiting
+```
+
+And the coder picks up what was left:
+
+```bash
+./codefactory worker --name coder --runtime fake --kinds implement_ticket --work-dir .factory-coder --once
+```
+
+```
+[worker] claimed task 0f22a66ecc55 (implement_ticket) "Implement search"
+[worker] task 0f22a66ecc55 -> succeeded
+```
+
+See who handles what:
+
+```bash
+curl -s localhost:7337/workers | jq '.[] | {name, runtime, kinds}'
+```
+
+Note that each worker has its own `--work-dir`. Sharing one is fine too — the
+worktrees are per task and attempt — but separate directories make it obvious
+which agent did what.
+
+### The review stage needs GitHub
+
+A `review_pr` task has to find a real PR, so it fails fast without `gh`:
+
+```
+[worker] claimed task 45eb74d7f504 (review_pr) "Review something"
+[worker] [45eb74d7f504] task failed: review tasks need GitHub access; run the worker with an authenticated gh
+[worker] task 45eb74d7f504 -> failed
+```
+
+To see the reviewer work, run Demo 2 through to a draft PR, then start a worker
+with `--kinds review_pr` and an authenticated `gh`.
+
 ## Things worth trying
 
 **Kill a worker mid-task.** Start a slow shell runtime, `Ctrl-C` the worker,

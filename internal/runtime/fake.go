@@ -28,9 +28,164 @@ func (f FakeRuntime) Run(rc RunContext) (Result, error) {
 	switch rc.Task.Kind {
 	case api.KindRefineTicket:
 		return f.refine(rc)
+	case api.KindReviewPR:
+		return f.review(rc)
 	default:
 		return f.implement(rc)
 	}
+}
+
+// review produces a deterministic review of the diff in the prompt.
+//
+// It never returns APPROVE. A fake reviewer approving code would be actively
+// dangerous: it would look like a real sign-off in the PR thread while having
+// read nothing. The worst it can do is ask a human to look.
+func (f FakeRuntime) review(rc RunContext) (Result, error) {
+	diff, ok := prompt.ExtractDiff(rc.Prompt)
+	if !ok {
+		rc.Log("fake runtime: no diff found in the prompt")
+	}
+
+	stats := analyseDiff(diff)
+	rc.Log("fake runtime: reviewing %d changed file(s), +%d/-%d lines",
+		len(stats.Files), stats.Added, stats.Removed)
+
+	verdict := prompt.VerdictComment
+	if len(stats.Findings) > 0 {
+		verdict = prompt.VerdictRequestChanges
+		rc.Log("fake runtime: %d finding(s) -> %s", len(stats.Findings), verdict)
+	}
+
+	review := buildReview(rc.Task, stats, verdict)
+	out := filepath.Join(rc.WorktreeDir, ".factory-review.md")
+	if err := os.WriteFile(out, []byte(review), 0o644); err != nil {
+		return Result{}, fmt.Errorf("write review: %w", err)
+	}
+	rc.Log("fake runtime: wrote .factory-review.md (%d bytes)", len(review))
+
+	summary := fmt.Sprintf("reviewed %d file(s): %s", len(stats.Files), verdict)
+	return Result{Summary: summary, Review: review, Verdict: verdict}, nil
+}
+
+// diffStats is what the fake reviewer can determine mechanically.
+type diffStats struct {
+	Files    []string
+	Added    int
+	Removed  int
+	Findings []string
+	NoTests  bool
+}
+
+// analyseDiff performs the small set of checks a reviewer can make without
+// understanding the code. Every finding points at a specific added line.
+func analyseDiff(diff string) diffStats {
+	var s diffStats
+	seen := map[string]bool{}
+
+	// Patterns worth flagging in *added* lines only.
+	checks := []struct{ needle, finding string }{
+		{"TODO", "an added line still contains a TODO"},
+		{"FIXME", "an added line still contains a FIXME"},
+		{"panic(", "an added line calls panic(); prefer returning an error"},
+		{"fmt.Println", "an added line uses fmt.Println; use the project's logger"},
+		{"console.log", "an added line uses console.log"},
+		{"password =", "an added line assigns something named password"},
+		{"api_key", "an added line mentions api_key"},
+		{"secret =", "an added line assigns something named secret"},
+	}
+
+	for _, line := range strings.Split(diff, "\n") {
+		switch {
+		case strings.HasPrefix(line, "+++ b/"):
+			name := strings.TrimPrefix(line, "+++ b/")
+			if name != "" && name != "/dev/null" && !seen[name] {
+				seen[name] = true
+				s.Files = append(s.Files, name)
+			}
+		case strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++"):
+			s.Added++
+			body := strings.TrimPrefix(line, "+")
+			for _, c := range checks {
+				if strings.Contains(body, c.needle) && !containsString(s.Findings, c.finding) {
+					s.Findings = append(s.Findings, c.finding)
+				}
+			}
+		case strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---"):
+			s.Removed++
+		}
+	}
+
+	// A change with no test touched is worth raising every time.
+	if len(s.Files) > 0 && !touchesTests(s.Files) {
+		s.NoTests = true
+		s.Findings = append(s.Findings, "no test file was added or changed")
+	}
+	return s
+}
+
+func touchesTests(files []string) bool {
+	for _, f := range files {
+		lower := strings.ToLower(f)
+		if strings.Contains(lower, "_test.") || strings.Contains(lower, "test_") ||
+			strings.Contains(lower, "/tests/") || strings.Contains(lower, ".test.") ||
+			strings.Contains(lower, "spec.") {
+			return true
+		}
+	}
+	return false
+}
+
+func containsString(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+func buildReview(task api.Task, stats diffStats, verdict string) string {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "## Verdict\n\n%s\n\n", verdict)
+
+	b.WriteString("## Summary\n\n")
+	if len(stats.Files) == 0 {
+		b.WriteString("No diff was available to review.\n\n")
+	} else {
+		fmt.Fprintf(&b, "%d file(s) changed, +%d/-%d lines:\n\n", len(stats.Files), stats.Added, stats.Removed)
+		for _, f := range stats.Files {
+			fmt.Fprintf(&b, "- `%s`\n", f)
+		}
+		b.WriteString("\n")
+	}
+
+	b.WriteString("## Blocking Issues\n\n")
+	if len(stats.Findings) == 0 {
+		b.WriteString("None found by the mechanical checks.\n\n")
+	} else {
+		for _, f := range stats.Findings {
+			fmt.Fprintf(&b, "- %s\n", f)
+		}
+		b.WriteString("\n")
+	}
+
+	b.WriteString("## Non-blocking Suggestions\n\n")
+	b.WriteString("- None. The `fake` runtime only performs mechanical checks.\n\n")
+
+	b.WriteString("## Test Coverage\n\n")
+	if stats.NoTests {
+		b.WriteString("No test file was added or changed by this PR.\n\n")
+	} else if len(stats.Files) > 0 {
+		b.WriteString("At least one test file was touched.\n\n")
+	} else {
+		b.WriteString("Not assessed: no diff was available.\n\n")
+	}
+
+	fmt.Fprintf(&b, "---\n**This review was produced by the `fake` runtime.** It performs mechanical\n"+
+		"checks only — it has not understood the code, and it never returns APPROVE.\n"+
+		"Task `%s`, generated %s.\n", task.ID, time.Now().UTC().Format(time.RFC3339))
+	return b.String()
 }
 
 // refine produces a filled-in ticket from the issue text.

@@ -20,6 +20,7 @@ import (
 	"github.com/HoaViet-Tech/factory/internal/githubcli"
 	"github.com/HoaViet-Tech/factory/internal/gitx"
 	"github.com/HoaViet-Tech/factory/internal/idgen"
+	"github.com/HoaViet-Tech/factory/internal/prompt"
 	agentruntime "github.com/HoaViet-Tech/factory/internal/runtime"
 )
 
@@ -37,6 +38,10 @@ type Config struct {
 	WorkDir string
 	// Runtime executes the task. One worker owns exactly one runtime.
 	Runtime agentruntime.Runtime
+	// Kinds restricts which task kinds this worker claims. Empty means all.
+	// This is how a multi-model pipeline is assembled: point one worker at
+	// refine_ticket, another at implement_ticket, a third at review_pr.
+	Kinds []string
 	// GitHub may be nil to disable all GitHub side effects.
 	GitHub *githubcli.Client
 	// LocalOnly records that the operator *chose* to run without GitHub
@@ -145,11 +150,17 @@ func (w *Worker) Run(ctx context.Context) error {
 		ID:      w.id,
 		Name:    w.cfg.Name,
 		Runtime: w.cfg.Runtime.Name(),
+		Kinds:   w.cfg.Kinds,
 	})
 	if err != nil {
 		return fmt.Errorf("register worker: %w", err)
 	}
-	w.logger.Printf("registered as %s (name=%s runtime=%s)", worker.ID, worker.Name, worker.Runtime)
+	handles := "all kinds"
+	if len(worker.Kinds) > 0 {
+		handles = strings.Join(worker.Kinds, ", ")
+	}
+	w.logger.Printf("registered as %s (name=%s runtime=%s handles=%s)",
+		worker.ID, worker.Name, worker.Runtime, handles)
 	w.logger.Printf("work dir: %s", w.cfg.WorkDir)
 
 	go w.heartbeatLoop(ctx)
@@ -162,7 +173,7 @@ func (w *Worker) Run(ctx context.Context) error {
 		default:
 		}
 
-		task, lease, err := w.api.Claim(w.id, w.cfg.LeaseSeconds)
+		task, lease, err := w.api.Claim(w.id, w.cfg.LeaseSeconds, w.cfg.Kinds)
 		if errors.Is(err, client.ErrNoTask) {
 			if w.cfg.Once {
 				w.logger.Printf("queue empty and --once set; exiting")
@@ -356,6 +367,37 @@ func (w *Worker) execute(ctx context.Context, task api.Task, logf func(string, s
 	}
 	baseRef := cache.BaseRef(defaultBranch)
 
+	// A review works on the PR's code, not on the default branch, so it
+	// branches from the PR head instead.
+	promptText := task.Prompt
+	var pr *githubcli.PullRequest
+	if task.Kind == api.KindReviewPR {
+		found, skip, err := w.resolvePRForReview(task, issue, logf)
+		if err != nil {
+			return agentruntime.Result{}, err
+		}
+		if skip != "" {
+			return agentruntime.Result{Summary: skip}, nil
+		}
+		pr = found
+
+		if ref := cache.BaseRef(pr.HeadRefName); ref != pr.HeadRefName {
+			baseRef = ref
+		} else {
+			return agentruntime.Result{}, fmt.Errorf(
+				"PR #%d's branch %q is not on the remote, so there is nothing to review; "+
+					"the implementing worker must run with --push", pr.Number, pr.HeadRefName)
+		}
+
+		// Rebuild the prompt now that the PR and its diff actually exist.
+		diff, err := w.cfg.GitHub.PRDiff(task.FullName(), pr.Number)
+		if err != nil {
+			return agentruntime.Result{}, fmt.Errorf("fetch PR diff: %w", err)
+		}
+		logf(api.EventInfo, "fetched diff for PR #%d (%d bytes)", pr.Number, len(diff))
+		promptText = prompt.WithDiff(buildReviewPrompt(task, issue, pr), diff)
+	}
+
 	branch := BranchName(task)
 	worktreeDir := w.worktreeDir(task)
 	logf(api.EventInfo, "creating worktree %s on branch %s (from %s)", worktreeDir, branch, baseRef)
@@ -368,17 +410,17 @@ func (w *Worker) execute(ctx context.Context, task api.Task, logf func(string, s
 	// The prompt goes in the worktree so the agent can read it as a file, and
 	// so it is visible in the diff-free workspace while debugging.
 	promptFile := filepath.Join(worktreeDir, ".factory-task.md")
-	if err := os.WriteFile(promptFile, []byte(task.Prompt), 0o644); err != nil {
+	if err := os.WriteFile(promptFile, []byte(promptText), 0o644); err != nil {
 		return agentruntime.Result{}, fmt.Errorf("write prompt file: %w", err)
 	}
-	logf(api.EventInfo, "wrote prompt to .factory-task.md (%d bytes)", len(task.Prompt))
+	logf(api.EventInfo, "wrote prompt to .factory-task.md (%d bytes)", len(promptText))
 
 	result, err := w.cfg.Runtime.Run(agentruntime.RunContext{
 		Ctx:         ctx,
 		Task:        task,
 		WorktreeDir: worktreeDir,
 		PromptFile:  promptFile,
-		Prompt:      task.Prompt,
+		Prompt:      promptText,
 		Log:         func(format string, args ...any) { logf(api.EventLog, format, args...) },
 	})
 	if err != nil {
@@ -404,6 +446,10 @@ func (w *Worker) execute(ctx context.Context, task api.Task, logf func(string, s
 			}
 		case api.KindImplementTicket:
 			if err := w.publishImplementation(task, *issue, wt, baseRef, result, logf); err != nil {
+				return result, err
+			}
+		case api.KindReviewPR:
+			if err := w.publishReview(task, *issue, *pr, result, logf); err != nil {
 				return result, err
 			}
 		}

@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -281,6 +282,94 @@ func (c *Client) CreateDraftPR(repo, head, base, title, body string) (string, er
 		return "", err
 	}
 	return strings.TrimSpace(lastNonEmptyLine(out)), nil
+}
+
+// PullRequest is the subset of a PR the reviewer needs.
+type PullRequest struct {
+	Number      int    `json:"number"`
+	Title       string `json:"title"`
+	Body        string `json:"body"`
+	URL         string `json:"url"`
+	State       string `json:"state"`
+	HeadRefName string `json:"headRefName"`
+	BaseRefName string `json:"baseRefName"`
+	IsDraft     bool   `json:"isDraft"`
+	Author      string `json:"-"`
+}
+
+type rawPR struct {
+	Number      int    `json:"number"`
+	Title       string `json:"title"`
+	Body        string `json:"body"`
+	URL         string `json:"url"`
+	State       string `json:"state"`
+	HeadRefName string `json:"headRefName"`
+	BaseRefName string `json:"baseRefName"`
+	IsDraft     bool   `json:"isDraft"`
+	Author      struct {
+		Login string `json:"login"`
+	} `json:"author"`
+}
+
+func (r rawPR) toPR() PullRequest {
+	return PullRequest{
+		Number: r.Number, Title: r.Title, Body: r.Body, URL: r.URL,
+		State: r.State, HeadRefName: r.HeadRefName, BaseRefName: r.BaseRefName,
+		IsDraft: r.IsDraft, Author: r.Author.Login,
+	}
+}
+
+// FindPRForIssue returns the open PR the factory opened for an issue, if any.
+//
+// The link is the PR body: the implement stage always writes "Closes #N". That
+// is more reliable than guessing from branch names, and it means a
+// hand-written PR that closes the issue is reviewable too.
+func (c *Client) FindPRForIssue(repo string, issueNumber int) (*PullRequest, error) {
+	out, err := c.run("",
+		"pr", "list",
+		"--repo", repo,
+		"--state", "open",
+		"--limit", "50",
+		"--json", "number,title,body,url,state,headRefName,baseRefName,isDraft,author",
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	var raw []rawPR
+	if err := json.Unmarshal([]byte(out), &raw); err != nil {
+		return nil, fmt.Errorf("parse gh pr list output: %w", err)
+	}
+
+	// Match "#N" only when it is not part of a longer number, so #7 does not
+	// match #70.
+	ref := regexp.MustCompile(`#` + fmt.Sprint(issueNumber) + `\b`)
+	for _, r := range raw {
+		if ref.MatchString(r.Body) {
+			pr := r.toPR()
+			return &pr, nil
+		}
+	}
+	return nil, nil
+}
+
+// PRDiff returns the unified diff of a pull request.
+func (c *Client) PRDiff(repo string, number int) (string, error) {
+	return c.run("", "pr", "diff", fmt.Sprint(number), "--repo", repo)
+}
+
+// CommentOnPR posts a comment on a pull request.
+//
+// This posts a normal comment rather than a formal GitHub review, on purpose:
+// a formal review can carry an APPROVE that counts towards branch protection,
+// and an agent should never be able to satisfy a human approval requirement.
+func (c *Client) CommentOnPR(repo string, number int, body string) error {
+	if c.DryRun {
+		c.logf("[dry-run] would comment on PR %s#%d (%d bytes)", repo, number, len(body))
+		return nil
+	}
+	_, err := c.run(body, "pr", "comment", fmt.Sprint(number), "--repo", repo, "--body-file", "-")
+	return err
 }
 
 // DefaultBranch returns the repository's default branch name.

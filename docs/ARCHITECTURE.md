@@ -90,6 +90,21 @@ transaction, keyed by `owner/name#number:workflow_kind` with a UNIQUE
 constraint. Poll an issue a hundred times and you get one task. Poll it for a
 *different* workflow (refine vs implement) and you correctly get a second one.
 
+### Routing: how one queue becomes a pipeline
+
+A worker registers with the task kinds it accepts (`workers.kinds`), and
+`ClaimTask` filters on them. Empty means "anything", so a single-worker setup
+is unchanged.
+
+This is what makes multi-model pipelines work. Without it the queue is FIFO
+across all kinds, so a worker running an expensive coding model would happily
+pick up a cheap refine task — and worse, a refine-only worker would pick up an
+implement task it has the wrong prompt and model for.
+
+The claim request may narrow further, but if it says nothing the server falls
+back to the kinds recorded at registration, so routing survives a worker that
+forgets to ask.
+
 ## 2. The control plane — `internal/server`
 
 A `net/http.ServeMux` using Go 1.22+ method+pattern routing, a thin JSON
@@ -205,6 +220,40 @@ and says why in its log.
 Without this, "I changed my mind and removed the label" would still result in
 an agent opening a PR.
 
+### The review stage
+
+`review_pr` is the one stage that does not work on the default branch.
+
+1. The poller sees `factory:review` and creates the task. Its prompt is a
+   **placeholder**: the PR and its diff do not exist at poll time.
+2. The worker finds the PR by searching open PRs for one whose body references
+   the issue (`Closes #N`, written by the implement stage). Matching on the body
+   rather than the branch name means a hand-written PR is reviewable too.
+3. It branches the worktree from the **PR head** instead of the default branch,
+   so the reviewing agent can read the surrounding code, not just the diff.
+4. It fetches the live diff with `gh pr diff` and rebuilds the prompt.
+5. The runtime writes `.factory-review.md`.
+6. The worker posts it as a PR comment and, on `REQUEST_CHANGES`, moves the
+   issue to `factory:blocked`.
+
+Three deliberate choices here:
+
+**Reviews are ordinary comments, never GitHub review approvals.** A formal
+approval can satisfy branch protection. An agent must not be able to do that.
+
+**`ParseVerdict` fails closed.** An empty, truncated or unparseable review
+resolves to `COMMENT`, never `APPROVE`, and it only reads inside the `##
+Verdict` section so the word "approve" in prose cannot flip the outcome.
+
+**The fake reviewer never returns `APPROVE`.** It performs mechanical checks
+only — added-line greps and "did any test file change?" — and says so in the
+comment it posts. A rubber stamp from something that read nothing is worse than
+no review.
+
+Known limitation: dedupe is per issue and workflow, so an issue gets **one**
+review, not a fresh one after each push. Re-reviewing on new commits needs a
+dedupe key that includes the head SHA.
+
 ## 6. Prompt safety — `internal/prompt`
 
 Issue bodies are written by anyone on the internet. They are **data**.
@@ -223,19 +272,27 @@ human labels issue factory:inbox
    │
    ├─ server polls  ──▶ dedupe key local/demo#7:refine_ticket  ──▶ task A queued
    │
-   ├─ worker claims A ──▶ re-reads issue ──▶ still factory:inbox? ──▶ +factory:refining
+   ├─ REFINER claims A ──▶ re-reads issue ──▶ still factory:inbox? ──▶ +factory:refining
    │      └─ worktree ──▶ runtime ──▶ .factory-refined.md
    │      └─ comment ticket, -factory:inbox -factory:refining, +factory:ready
    │
    ├─ server polls  ──▶ dedupe key local/demo#7:implement_ticket ──▶ task B queued
    │
-   └─ worker claims B ──▶ still factory:ready? ──▶ +factory:active
-          └─ worktree ──▶ runtime edits files ──▶ commit
-          └─ (--push) push branch ──▶ draft PR ──▶ comment link ──▶ +factory:review
+   ├─ CODER claims B ──▶ still factory:ready? ──▶ +factory:active
+   │      └─ worktree ──▶ runtime edits files ──▶ commit
+   │      └─ (--push) push branch ──▶ draft PR ──▶ comment link ──▶ +factory:review
+   │
+   ├─ server polls  ──▶ dedupe key local/demo#7:review_pr ──▶ task C queued
+   │
+   └─ REVIEWER claims C ──▶ finds the PR ──▶ worktree at PR head ──▶ gh pr diff
+          └─ runtime ──▶ .factory-review.md ──▶ comment on the PR
+          └─ REQUEST_CHANGES? ──▶ -factory:review +factory:blocked
 ```
 
-At every arrow, a crash means the lease expires and the task is retried. At
-every GitHub mutation, the label is checked live first.
+Each stage is claimed by a worker that declared that kind, so REFINER, CODER
+and REVIEWER can be three different models. At every arrow a crash means the
+lease expires and the task is retried on a fresh attempt branch. At every
+GitHub mutation, the label is checked live first.
 
 ## Deliberate omissions
 
@@ -244,4 +301,5 @@ every GitHub mutation, the label is checked live first.
 | Auth on the API | It binds to 127.0.0.1; add auth before it ever leaves localhost |
 | Multi-node | `SetMaxOpenConns(1)` and a local file assume one machine |
 | Automatic merging | A human reviews. Always. |
-| `review_pr` workflow | The kind exists in the schema; no poller or handler yet |
+| Re-review after new commits | Dedupe is per issue+workflow; needs a head-SHA key |
+| Retry backoff | `MaxAttempts` is 3 with no delay between attempts |

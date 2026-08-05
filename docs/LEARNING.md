@@ -207,12 +207,46 @@ Only now. Swap the fake runtime for a command template with `{{prompt_file}}`,
 
 ---
 
+---
+
+## Milestone 10 — Routing, and a second opinion
+
+Two changes turn the single pool of workers into a pipeline.
+
+**Build:** a `kinds` column on `workers`, a kind filter in `ClaimTask`, and a
+`--kinds` flag. Empty means "all kinds" so the single-worker setup keeps
+working. Then add the `review_pr` stage: poll `factory:review`, find the PR,
+branch the worktree from the **PR head** rather than the default branch, fetch
+the diff, and post the review as a comment.
+
+**Traps:**
+- Filtering in the worker instead of the query. If the worker claims a task and
+  then rejects it, the task has already been leased and its attempt count
+  burned. Filter in SQL.
+- Trusting the claim request alone. Fall back to the kinds recorded at
+  registration, so a worker that forgets to ask is still routed correctly.
+- Posting a formal GitHub *review* rather than a comment. An approval can
+  satisfy branch protection; an agent must never be able to do that.
+- Parsing the verdict loosely. `ParseVerdict` must fail closed — an
+  unparseable review is a `COMMENT`, never an `APPROVE` — and it should only
+  read inside the verdict section, or the word "approve" in prose flips it.
+- Letting a fake reviewer approve. Mechanical checks that rubber-stamp a PR are
+  worse than no review at all.
+- Reusing the implement stage's worktree logic unchanged. A review works on the
+  PR's branch; branching from `main` reviews the wrong code.
+
+**Test:** queue an implement task *before* a refine task, then check that a
+refine-only worker takes the newer refine task. That ordering is the whole
+point — FIFO alone would hand it the wrong one.
+
 ## If you want to go further
 
 - **Lease renewal.** A worker heartbeating its lease mid-task, so long runs do
   not need a long fixed lease.
-- **The `review_pr` workflow.** The task kind exists; nothing implements it.
+- **Re-review after new commits.** Dedupe is per issue and workflow, so an issue
+  gets one review. Include the PR head SHA in the key to review each push.
 - **Concurrency per worker.** One task at a time is a deliberate simplification.
+- **Retry backoff.** Three attempts fire back to back with no delay.
 - **Auth.** The API binds to localhost and trusts every caller. That has to
   change before it is exposed.
 - **A real dashboard.** `GET /tasks` and `GET /tasks/{id}/events` are already

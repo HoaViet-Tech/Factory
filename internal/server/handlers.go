@@ -144,7 +144,8 @@ func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 	}
 	// A worker must be registered before it can claim: this keeps the worker
 	// registry honest and gives a clear error when someone forgets.
-	if _, err := s.store.GetWorker(req.WorkerID); err != nil {
+	worker, err := s.store.GetWorker(req.WorkerID)
+	if err != nil {
 		writeStoreErr(w, err)
 		return
 	}
@@ -154,7 +155,14 @@ func (s *Server) handleClaimTask(w http.ResponseWriter, r *http.Request) {
 		lease = time.Duration(req.LeaseSeconds) * time.Second
 	}
 
-	task, token, err := s.store.ClaimTask(req.WorkerID, lease)
+	// The request may narrow the claim; otherwise the worker's registered
+	// kinds apply, so routing survives a worker that forgets to ask.
+	kinds := req.Kinds
+	if len(kinds) == 0 {
+		kinds = worker.Kinds
+	}
+
+	task, token, err := s.store.ClaimTask(req.WorkerID, lease, kinds)
 	if err != nil {
 		// An empty queue is normal, not an error.
 		if errors.Is(err, store.ErrNotFound) {

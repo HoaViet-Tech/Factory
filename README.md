@@ -83,11 +83,11 @@ Label an issue and the factory picks it up:
 | `factory:needs-human` | Too ambiguous to implement safely |
 | `factory:ready` | Refined; safe to implement |
 | `factory:active` | An implement task is in flight |
-| `factory:review` | A draft PR is waiting for review |
+| `factory:review` | A draft PR is open; the review stage picks this up |
 | `factory:blocked` | The agent could not finish |
 | `factory:done` | Finished |
 
-The two flows:
+The three flows:
 
 1. **Refine.** Poll `factory:inbox` → create one `refine_ticket` task →
    worker re-reads the live issue, runs the runtime, comments a structured
@@ -97,6 +97,9 @@ The two flows:
    worker branches, works in a worktree, and if files changed, commits and
    (with `--push`) opens a **draft** PR, then labels the issue
    `factory:review`.
+3. **Review.** Poll `factory:review` → create one `review_pr` task → worker
+   finds the PR, checks out its head in a worktree, fetches the diff, and posts
+   a review comment. `REQUEST_CHANGES` moves the issue to `factory:blocked`.
 
 Bootstrap the labels once, then poll:
 
@@ -107,6 +110,47 @@ Bootstrap the labels once, then poll:
 ```bash
 ./codefactory github poll --server http://127.0.0.1:7337
 ```
+
+## Multi-agent pipelines
+
+A worker claims only the task kinds it declares, so you assign a different
+model to each stage by running one worker per stage:
+
+```bash
+./codefactory worker --name refiner  --kinds refine_ticket    --runtime claude --runtime-command "claude --print --model claude-haiku-4-5-20251001" --runtime-stdin
+```
+
+```bash
+./codefactory worker --name coder    --kinds implement_ticket --runtime claude --push
+```
+
+```bash
+./codefactory worker --name reviewer --kinds review_pr        --runtime codex
+```
+
+Omit `--kinds` and a worker takes anything, which is what a single-worker setup
+wants.
+
+Why bother: **the review stage is worth a different model than the implement
+stage.** A model reviewing its own output shares its own blind spots — if it
+misread the requirement while coding, it will misread it the same way while
+reviewing. Different providers give genuinely independent failure modes.
+Refine-vs-implement matters much less; use a cheap model there because it runs
+on every inbox issue.
+
+Check what each worker is handling:
+
+```bash
+curl -s localhost:7337/workers | jq '.[] | {name, runtime, kinds}'
+```
+
+Two constraints worth knowing before you wire this up:
+
+- **Each stage is a CLI invocation that edits files in a directory.** A model
+  needs a headless CLI to participate; a chat UI cannot.
+- **Reviews are posted as ordinary PR comments, never as GitHub approvals.** An
+  agent must not be able to satisfy a human approval requirement on a protected
+  branch.
 
 ## Runtimes
 

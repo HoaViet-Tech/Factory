@@ -73,6 +73,15 @@ CREATE TABLE github_observations (
 );
 `,
 	},
+	{
+		// Workers declare which task kinds they accept, so a pipeline can put a
+		// different model on each stage. Empty means "all kinds", which is what
+		// every existing row should mean after this migration.
+		Name: "0002_worker_kinds",
+		SQL: `
+ALTER TABLE workers ADD COLUMN kinds TEXT NOT NULL DEFAULT '';
+`,
+	},
 }
 
 // migrate creates schema_migrations if needed and applies anything missing.

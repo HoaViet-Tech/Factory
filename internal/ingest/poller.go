@@ -62,6 +62,22 @@ func workflows() []workflow {
 				return prompt.ForImplement(toContext(repo, iss))
 			},
 		},
+		{
+			// The implement stage labels an issue factory:review once its draft
+			// PR is open, so this workflow picks the PR up for review.
+			//
+			// The prompt here is a placeholder: the worker rebuilds it once it
+			// has resolved the actual PR and fetched the live diff, neither of
+			// which exists at poll time.
+			label: labels.Review,
+			kind:  api.KindReviewPR,
+			buildTitle: func(iss githubcli.Issue) string {
+				return fmt.Sprintf("Review PR for #%d: %s", iss.Number, iss.Title)
+			},
+			buildBody: func(repo string, iss githubcli.Issue) string {
+				return prompt.ForReview(toContext(repo, iss), prompt.PRContext{})
+			},
+		},
 	}
 }
 

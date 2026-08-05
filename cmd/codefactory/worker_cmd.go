@@ -7,9 +7,11 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/HoaViet-Tech/factory/internal/api"
 	"github.com/HoaViet-Tech/factory/internal/githubcli"
 	agentruntime "github.com/HoaViet-Tech/factory/internal/runtime"
 	"github.com/HoaViet-Tech/factory/internal/worker"
@@ -21,6 +23,7 @@ func runWorker(args []string) error {
 	name := fs.String("name", "local", "human-readable worker name")
 	id := fs.String("id", "", "stable worker ID (default: persisted in <work-dir>/worker-id)")
 	runtimeName := fs.String("runtime", agentruntime.Fake, "runtime: fake, shell, codex or claude")
+	kinds := fs.String("kinds", "", "comma-separated task kinds this worker accepts, e.g. refine_ticket (default: all kinds)")
 	runtimeCmd := fs.String("runtime-command", "", "command template for shell/codex/claude runtimes ({{prompt_file}}, {{worktree}}, {{task_id}})")
 	runtimeStdin := fs.Bool("runtime-stdin", false, "feed the prompt to the runtime command on stdin")
 	workDir := fs.String("work-dir", ".factory", "directory for the repo cache, worktrees and worker id")
@@ -41,6 +44,11 @@ func runWorker(args []string) error {
 	logger := log.New(os.Stdout, "[worker] ", log.LstdFlags)
 
 	rt, err := buildRuntime(*runtimeName, *runtimeCmd, *runtimeStdin)
+	if err != nil {
+		return err
+	}
+
+	kindList, err := parseKinds(*kinds)
 	if err != nil {
 		return err
 	}
@@ -68,6 +76,7 @@ func runWorker(args []string) error {
 		ID:           *id,
 		WorkDir:      *workDir,
 		Runtime:      rt,
+		Kinds:        kindList,
 		GitHub:       gh,
 		LocalOnly:    *noGitHub,
 		Push:         *push,
@@ -84,6 +93,28 @@ func runWorker(args []string) error {
 	defer stop()
 
 	return w.Run(ctx)
+}
+
+// parseKinds turns the --kinds flag into a validated list. An unknown kind is
+// rejected at startup rather than producing a worker that silently claims
+// nothing forever.
+func parseKinds(raw string) ([]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		k := strings.TrimSpace(part)
+		if k == "" {
+			continue
+		}
+		if !api.IsValidKind(k) {
+			return nil, fmt.Errorf("unknown task kind %q in --kinds (valid: %s)",
+				k, strings.Join(api.ValidKinds(), ", "))
+		}
+		out = append(out, k)
+	}
+	return out, nil
 }
 
 // buildRuntime turns the --runtime flags into a Runtime, failing early and

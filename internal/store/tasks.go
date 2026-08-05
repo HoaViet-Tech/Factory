@@ -174,16 +174,27 @@ func (s *Store) ListTasks(f TaskFilter) ([]api.Task, error) {
 }
 
 // ClaimTask atomically hands the oldest queued task to a worker and stamps a
-// lease on it. It returns ErrNotFound when the queue is empty.
+// lease on it. It returns ErrNotFound when no matching task is queued.
+//
+// kinds restricts which task kinds this worker will accept; empty means all of
+// them. That filter is what turns one undifferentiated pool of workers into a
+// pipeline, where a cheap model refines, a strong one implements, and a third
+// reviews.
 //
 // The lease is the whole trick that makes dead workers safe: if the worker
 // disappears, the lease expires and ReapExpiredLeases puts the task back.
-func (s *Store) ClaimTask(workerID string, leaseFor time.Duration) (api.Task, string, error) {
+func (s *Store) ClaimTask(workerID string, leaseFor time.Duration, kinds []string) (api.Task, string, error) {
 	if workerID == "" {
 		return api.Task{}, "", errors.New("worker_id is required")
 	}
 	if leaseFor <= 0 {
 		leaseFor = 2 * time.Minute
+	}
+	for _, k := range kinds {
+		if !api.IsValidKind(k) {
+			return api.Task{}, "", fmt.Errorf("invalid task kind %q (valid: %s)",
+				k, strings.Join(api.ValidKinds(), ", "))
+		}
 	}
 
 	tx, err := s.db.Begin()
@@ -192,10 +203,18 @@ func (s *Store) ClaimTask(workerID string, leaseFor time.Duration) (api.Task, st
 	}
 	defer tx.Rollback()
 
-	// Oldest queued task first: a plain FIFO queue.
-	row := tx.QueryRow(`SELECT ` + taskColumns + ` FROM tasks
-		WHERE status = '` + api.StatusQueued + `'
-		ORDER BY created_at ASC, id ASC LIMIT 1`)
+	// Oldest matching queued task first: a plain FIFO queue, per kind filter.
+	query := `SELECT ` + taskColumns + ` FROM tasks WHERE status = ?`
+	args := []any{api.StatusQueued}
+	if len(kinds) > 0 {
+		query += ` AND kind IN (?` + strings.Repeat(`, ?`, len(kinds)-1) + `)`
+		for _, k := range kinds {
+			args = append(args, k)
+		}
+	}
+	query += ` ORDER BY created_at ASC, id ASC LIMIT 1`
+
+	row := tx.QueryRow(query, args...)
 	t, err := scanTask(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return api.Task{}, "", ErrNotFound

@@ -42,6 +42,10 @@ type Result struct {
 	Summary string
 	// RefinedTicket is the structured ticket produced by a refine task.
 	RefinedTicket string
+	// Review is the review document produced by a review task.
+	Review string
+	// Verdict is the review verdict (APPROVE, REQUEST_CHANGES, COMMENT).
+	Verdict string
 	// NeedsHuman marks a refine result as too ambiguous to implement.
 	NeedsHuman bool
 	// Reason explains NeedsHuman, or why an implement task produced nothing.

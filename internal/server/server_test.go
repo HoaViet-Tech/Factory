@@ -117,7 +117,7 @@ func TestWorkerClaimAndCompleteOverHTTP(t *testing.T) {
 	c, _ := newTestServer(t, nil)
 
 	// An unregistered worker cannot claim.
-	if _, _, err := c.Claim("ghost-worker", 60); err == nil {
+	if _, _, err := c.Claim("ghost-worker", 60, nil); err == nil {
 		t.Error("an unregistered worker should not be able to claim")
 	}
 
@@ -127,7 +127,7 @@ func TestWorkerClaimAndCompleteOverHTTP(t *testing.T) {
 	}
 
 	// An empty queue is a normal, non-error condition.
-	if _, _, err := c.Claim(worker.ID, 60); !errors.Is(err, client.ErrNoTask) {
+	if _, _, err := c.Claim(worker.ID, 60, nil); !errors.Is(err, client.ErrNoTask) {
 		t.Errorf("claim on an empty queue returned %v, want ErrNoTask", err)
 	}
 
@@ -138,7 +138,7 @@ func TestWorkerClaimAndCompleteOverHTTP(t *testing.T) {
 		t.Fatalf("create task: %v", err)
 	}
 
-	claimed, lease, err := c.Claim(worker.ID, 60)
+	claimed, lease, err := c.Claim(worker.ID, 60, nil)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -189,7 +189,7 @@ func TestCompleteRejectsWrongLeaseOverHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create task: %v", err)
 	}
-	if _, _, err := c.Claim(worker.ID, 60); err != nil {
+	if _, _, err := c.Claim(worker.ID, 60, nil); err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 
@@ -249,6 +249,103 @@ func TestPollIsDisabledWithoutGitHub(t *testing.T) {
 
 	if _, err := c.Poll(); err == nil {
 		t.Error("polling without a GitHub client should return a clear error")
+	}
+}
+
+// TestPollCreatesReviewTasks covers the third pipeline stage: an issue labelled
+// factory:review becomes exactly one review_pr task.
+func TestPollCreatesReviewTasks(t *testing.T) {
+	gh := &fakeGitHub{issues: map[string][]githubcli.Issue{
+		"factory:review": {{
+			Number: 11,
+			Title:  "Add a health endpoint",
+			Body:   "The service should expose /healthz returning 200 when it is ready.",
+			Labels: []string{"factory:review"},
+			Author: "someone",
+			URL:    "https://github.com/local/demo/issues/11",
+		}},
+	}}
+
+	c, _ := newTestServer(t, gh)
+	if _, err := c.AddRepository(api.CreateRepositoryRequest{Owner: "local", Name: "demo"}); err != nil {
+		t.Fatalf("add repository: %v", err)
+	}
+
+	resp, err := c.Poll()
+	if err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if resp.TasksCreated != 1 {
+		t.Fatalf("created %d tasks, want 1", resp.TasksCreated)
+	}
+
+	tasks, err := c.ListTasks("", api.KindReviewPR, "", 0)
+	if err != nil {
+		t.Fatalf("list tasks: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("found %d review tasks, want 1", len(tasks))
+	}
+	if tasks[0].GitHubIssueNumber == nil || *tasks[0].GitHubIssueNumber != 11 {
+		t.Errorf("review task is not linked to issue #11: %+v", tasks[0].GitHubIssueNumber)
+	}
+
+	// Dedupe applies to reviews too.
+	again, err := c.Poll()
+	if err != nil {
+		t.Fatalf("second poll: %v", err)
+	}
+	if again.TasksCreated != 0 {
+		t.Errorf("second poll created %d tasks, want 0", again.TasksCreated)
+	}
+}
+
+// TestClaimRoutingOverHTTP proves routing survives the wire, including the
+// fallback to the kinds recorded at registration.
+func TestClaimRoutingOverHTTP(t *testing.T) {
+	c, _ := newTestServer(t, nil)
+
+	reviewer, err := c.RegisterWorker(api.RegisterWorkerRequest{
+		Name: "reviewer", Runtime: "fake", Kinds: []string{api.KindReviewPR},
+	})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	if _, err := c.CreateTask(api.CreateTaskRequest{
+		Kind: api.KindImplementTicket, RepoOwner: "local", RepoName: "demo",
+		Title: "not for the reviewer", Prompt: "x",
+	}); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+
+	// Claiming without asking for kinds must still respect registration.
+	if _, _, err := c.Claim(reviewer.ID, 60, nil); !errors.Is(err, client.ErrNoTask) {
+		t.Errorf("reviewer claimed an implement task: %v", err)
+	}
+
+	review, err := c.CreateTask(api.CreateTaskRequest{
+		Kind: api.KindReviewPR, RepoOwner: "local", RepoName: "demo",
+		Title: "for the reviewer", Prompt: "x",
+	})
+	if err != nil {
+		t.Fatalf("create review task: %v", err)
+	}
+
+	claimed, _, err := c.Claim(reviewer.ID, 60, nil)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if claimed.ID != review.ID {
+		t.Errorf("claimed %q, want the review task", claimed.Title)
+	}
+
+	workers, err := c.ListWorkers()
+	if err != nil {
+		t.Fatalf("list workers: %v", err)
+	}
+	if len(workers) != 1 || len(workers[0].Kinds) != 1 || workers[0].Kinds[0] != api.KindReviewPR {
+		t.Errorf("worker kinds not reported by the API: %+v", workers)
 	}
 }
 

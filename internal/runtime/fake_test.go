@@ -110,6 +110,90 @@ func TestFakeRuntimeImplementWritesAFile(t *testing.T) {
 	}
 }
 
+func TestFakeRuntimeReviewFindsProblemsInADiff(t *testing.T) {
+	task := api.Task{ID: "rev001", Kind: api.KindReviewPR, RepoOwner: "local", RepoName: "demo"}
+
+	diff := `diff --git a/auth.go b/auth.go
+--- a/auth.go
++++ b/auth.go
+@@ -1,3 +1,6 @@
+ package auth
++
++// TODO: handle expiry
++func Login(u string) { panic("not done") }
+`
+	promptText := prompt.WithDiff(
+		prompt.ForReview(
+			prompt.IssueContext{Repo: "local/demo", Number: 4, Title: "Add login", Body: "It should log users in."},
+			prompt.PRContext{Number: 11, Title: "Add login", HeadRefName: "factory/task-x-attempt-1", BaseRefName: "main"},
+		), diff)
+
+	rc := newRunContext(t, task, promptText)
+	res, err := FakeRuntime{}.Run(rc)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if res.Verdict != prompt.VerdictRequestChanges {
+		t.Errorf("verdict = %q, want REQUEST_CHANGES for a diff with a TODO and a panic", res.Verdict)
+	}
+	for _, want := range []string{"TODO", "panic(", "no test file"} {
+		if !strings.Contains(res.Review, want) {
+			t.Errorf("review does not mention %q:\n%s", want, res.Review)
+		}
+	}
+	if !strings.Contains(res.Review, "auth.go") {
+		t.Error("the review should name the changed file")
+	}
+	for _, heading := range prompt.ReviewHeadings() {
+		if !strings.Contains(res.Review, heading) {
+			t.Errorf("review is missing the %q heading", heading)
+		}
+	}
+
+	data, err := os.ReadFile(filepath.Join(rc.WorktreeDir, ".factory-review.md"))
+	if err != nil {
+		t.Fatalf("read .factory-review.md: %v", err)
+	}
+	if string(data) != res.Review {
+		t.Error("the file and the returned review should match")
+	}
+}
+
+// The fake reviewer must never approve: a rubber-stamp approval in a PR thread
+// would look like a real sign-off from something that read nothing.
+func TestFakeRuntimeReviewNeverApproves(t *testing.T) {
+	task := api.Task{ID: "rev002", Kind: api.KindReviewPR, RepoOwner: "local", RepoName: "demo"}
+
+	// A spotless diff that even touches tests.
+	diff := `diff --git a/sum_test.go b/sum_test.go
+--- a/sum_test.go
++++ b/sum_test.go
+@@ -1,2 +1,5 @@
+ package math
++
++func TestSum(t *testing.T) { if Sum(1, 2) != 3 { t.Fail() } }
+`
+	promptText := prompt.WithDiff(prompt.ForReview(
+		prompt.IssueContext{Repo: "local/demo", Number: 5, Title: "Test sum", Body: "It should be tested."},
+		prompt.PRContext{Number: 12},
+	), diff)
+
+	res, err := FakeRuntime{}.Run(newRunContext(t, task, promptText))
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Verdict == prompt.VerdictApprove {
+		t.Fatal("the fake reviewer must never return APPROVE")
+	}
+	if res.Verdict != prompt.VerdictComment {
+		t.Errorf("verdict = %q, want COMMENT for a clean diff", res.Verdict)
+	}
+	if !strings.Contains(res.Review, "never returns APPROVE") {
+		t.Error("the review should disclose that it is mechanical")
+	}
+}
+
 func TestNewCommandRuntimeUsesDefaultTemplates(t *testing.T) {
 	rt, err := NewCommandRuntime(Claude, "", false)
 	if err != nil {

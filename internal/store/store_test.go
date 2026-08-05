@@ -123,7 +123,7 @@ func TestClaimAndComplete(t *testing.T) {
 	worker := mustRegisterWorker(t, st)
 	created := mustCreateTask(t, st, "claim me")
 
-	claimed, token, err := st.ClaimTask(worker.ID, time.Minute)
+	claimed, token, err := st.ClaimTask(worker.ID, time.Minute, nil)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestClaimAndComplete(t *testing.T) {
 	}
 
 	// The queue is now empty.
-	if _, _, err := st.ClaimTask(worker.ID, time.Minute); !errors.Is(err, ErrNotFound) {
+	if _, _, err := st.ClaimTask(worker.ID, time.Minute, nil); !errors.Is(err, ErrNotFound) {
 		t.Errorf("second claim returned %v, want ErrNotFound", err)
 	}
 
@@ -157,12 +157,115 @@ func TestClaimAndComplete(t *testing.T) {
 	}
 }
 
+// TestClaimRoutesByKind covers the multi-agent pipeline: each worker only ever
+// picks up the stage it is meant to run.
+func TestClaimRoutesByKind(t *testing.T) {
+	st := newTestStore(t)
+
+	newWorker := func(name string, kinds ...string) api.Worker {
+		w, err := st.RegisterWorker(api.RegisterWorkerRequest{Name: name, Runtime: "fake", Kinds: kinds})
+		if err != nil {
+			t.Fatalf("register %s: %v", name, err)
+		}
+		if len(w.Kinds) != len(kinds) {
+			t.Fatalf("%s registered with kinds %v, want %v", name, w.Kinds, kinds)
+		}
+		return w
+	}
+
+	refiner := newWorker("refiner", api.KindRefineTicket)
+	coder := newWorker("coder", api.KindImplementTicket)
+	reviewer := newWorker("reviewer", api.KindReviewPR)
+
+	newTask := func(kind, title string) api.Task {
+		task, err := st.CreateTask(api.CreateTaskRequest{
+			Kind: kind, RepoOwner: "local", RepoName: "demo", Title: title, Prompt: "x",
+		})
+		if err != nil {
+			t.Fatalf("create %s task: %v", kind, err)
+		}
+		return task
+	}
+
+	// Deliberately queue the implement task first: without kind filtering the
+	// refiner would take it, since the queue is FIFO.
+	implement := newTask(api.KindImplementTicket, "implement me")
+	refine := newTask(api.KindRefineTicket, "refine me")
+	review := newTask(api.KindReviewPR, "review me")
+
+	claimed, _, err := st.ClaimTask(refiner.ID, time.Minute, refiner.Kinds)
+	if err != nil {
+		t.Fatalf("refiner claim: %v", err)
+	}
+	if claimed.ID != refine.ID {
+		t.Fatalf("refiner claimed %q (%s), want the refine task", claimed.Title, claimed.Kind)
+	}
+
+	claimed, _, err = st.ClaimTask(reviewer.ID, time.Minute, reviewer.Kinds)
+	if err != nil {
+		t.Fatalf("reviewer claim: %v", err)
+	}
+	if claimed.ID != review.ID {
+		t.Fatalf("reviewer claimed %q (%s), want the review task", claimed.Title, claimed.Kind)
+	}
+
+	claimed, _, err = st.ClaimTask(coder.ID, time.Minute, coder.Kinds)
+	if err != nil {
+		t.Fatalf("coder claim: %v", err)
+	}
+	if claimed.ID != implement.ID {
+		t.Fatalf("coder claimed %q (%s), want the implement task", claimed.Title, claimed.Kind)
+	}
+
+	// Every worker's queue is now empty even though tasks exist for others.
+	for _, w := range []api.Worker{refiner, coder, reviewer} {
+		if _, _, err := st.ClaimTask(w.ID, time.Minute, w.Kinds); !errors.Is(err, ErrNotFound) {
+			t.Errorf("%s claimed a second task: %v", w.Name, err)
+		}
+	}
+}
+
+func TestClaimWithoutKindsTakesAnything(t *testing.T) {
+	st := newTestStore(t)
+	worker := mustRegisterWorker(t, st)
+
+	if _, err := st.CreateTask(api.CreateTaskRequest{
+		Kind: api.KindReviewPR, RepoOwner: "local", RepoName: "demo", Title: "review", Prompt: "x",
+	}); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+
+	// A worker with no kinds is a general-purpose worker: it takes whatever is
+	// queued. This keeps the single-worker setup working unchanged.
+	claimed, _, err := st.ClaimTask(worker.ID, time.Minute, nil)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if claimed.Kind != api.KindReviewPR {
+		t.Errorf("claimed kind = %q, want review_pr", claimed.Kind)
+	}
+}
+
+func TestClaimRejectsUnknownKind(t *testing.T) {
+	st := newTestStore(t)
+	worker := mustRegisterWorker(t, st)
+
+	if _, _, err := st.ClaimTask(worker.ID, time.Minute, []string{"not_a_kind"}); err == nil {
+		t.Error("claiming an unknown kind should fail loudly, not silently match nothing")
+	}
+	if _, err := st.RegisterWorker(api.RegisterWorkerRequest{
+		Name: "bad", Runtime: "fake", Kinds: []string{"nonsense"},
+	}); err == nil {
+		t.Error("registering with an unknown kind should fail")
+	}
+}
+
 func TestCompleteRequiresValidLeaseToken(t *testing.T) {
 	st := newTestStore(t)
 	worker := mustRegisterWorker(t, st)
 	created := mustCreateTask(t, st, "lease me")
 
-	_, token, err := st.ClaimTask(worker.ID, time.Minute)
+	_, token, err := st.ClaimTask(worker.ID, time.Minute, nil)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -200,7 +303,7 @@ func TestExpiredLeaseIsRequeuedThenLost(t *testing.T) {
 	st.SetClock(func() time.Time { return now })
 
 	for attempt := 1; attempt <= MaxAttempts; attempt++ {
-		claimed, _, err := st.ClaimTask(worker.ID, time.Minute)
+		claimed, _, err := st.ClaimTask(worker.ID, time.Minute, nil)
 		if err != nil {
 			t.Fatalf("claim %d: %v", attempt, err)
 		}
@@ -237,7 +340,7 @@ func TestExpiredLeaseIsRequeuedThenLost(t *testing.T) {
 	}
 
 	// A lost task is terminal, so nothing claims it again.
-	if _, _, err := st.ClaimTask(worker.ID, time.Minute); !errors.Is(err, ErrNotFound) {
+	if _, _, err := st.ClaimTask(worker.ID, time.Minute, nil); !errors.Is(err, ErrNotFound) {
 		t.Errorf("claim after lost returned %v, want ErrNotFound", err)
 	}
 }
@@ -253,7 +356,7 @@ func TestRenewLeaseKeepsALongTaskAlive(t *testing.T) {
 	now := time.Now().UTC()
 	st.SetClock(func() time.Time { return now })
 
-	_, token, err := st.ClaimTask(worker.ID, time.Minute)
+	_, token, err := st.ClaimTask(worker.ID, time.Minute, nil)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -297,7 +400,7 @@ func TestRenewLeaseRejectsNonOwners(t *testing.T) {
 	worker := mustRegisterWorker(t, st)
 	created := mustCreateTask(t, st, "protected")
 
-	_, token, err := st.ClaimTask(worker.ID, time.Minute)
+	_, token, err := st.ClaimTask(worker.ID, time.Minute, nil)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -325,7 +428,7 @@ func TestLeaseNotExpiredIsLeftAlone(t *testing.T) {
 	worker := mustRegisterWorker(t, st)
 	created := mustCreateTask(t, st, "still working")
 
-	if _, _, err := st.ClaimTask(worker.ID, time.Hour); err != nil {
+	if _, _, err := st.ClaimTask(worker.ID, time.Hour, nil); err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 	reaped, err := st.ReapExpiredLeases()
