@@ -242,6 +242,84 @@ func TestExpiredLeaseIsRequeuedThenLost(t *testing.T) {
 	}
 }
 
+// TestRenewLeaseKeepsALongTaskAlive is the regression test for the bug where a
+// task outliving its lease was requeued and executed a second time while the
+// first worker was still editing files.
+func TestRenewLeaseKeepsALongTaskAlive(t *testing.T) {
+	st := newTestStore(t)
+	worker := mustRegisterWorker(t, st)
+	created := mustCreateTask(t, st, "a slow agent run")
+
+	now := time.Now().UTC()
+	st.SetClock(func() time.Time { return now })
+
+	_, token, err := st.ClaimTask(worker.ID, time.Minute)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	// Simulate a task that runs for five minutes with a one-minute lease,
+	// renewing every 30 seconds as the worker does.
+	for elapsed := 0; elapsed < 5*60; elapsed += 30 {
+		now = now.Add(30 * time.Second)
+
+		if _, err := st.RenewLease(created.ID, token, time.Minute); err != nil {
+			t.Fatalf("renew at %ds: %v", elapsed, err)
+		}
+		reaped, err := st.ReapExpiredLeases()
+		if err != nil {
+			t.Fatalf("reap at %ds: %v", elapsed, err)
+		}
+		if len(reaped) != 0 {
+			t.Fatalf("a renewed task was reaped at %ds; this is the duplicate-work bug", elapsed)
+		}
+	}
+
+	got, err := st.GetTask(created.ID)
+	if err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	if got.Status != api.StatusRunning {
+		t.Fatalf("status = %q, want still running after renewals", got.Status)
+	}
+	if got.AttemptCount != 1 {
+		t.Errorf("attempt count = %d, want 1: renewal must not look like a retry", got.AttemptCount)
+	}
+
+	// The worker still owns the task and can finish it.
+	if _, err := st.CompleteTask(created.ID, token, api.StatusSucceeded, "done"); err != nil {
+		t.Fatalf("complete after renewals: %v", err)
+	}
+}
+
+func TestRenewLeaseRejectsNonOwners(t *testing.T) {
+	st := newTestStore(t)
+	worker := mustRegisterWorker(t, st)
+	created := mustCreateTask(t, st, "protected")
+
+	_, token, err := st.ClaimTask(worker.ID, time.Minute)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	if _, err := st.RenewLease(created.ID, "someone-elses-token", time.Minute); !errors.Is(err, ErrInvalidLease) {
+		t.Errorf("renewing with a foreign token returned %v, want ErrInvalidLease", err)
+	}
+	if _, err := st.RenewLease("no-such-task", token, time.Minute); !errors.Is(err, ErrNotFound) {
+		t.Errorf("renewing an unknown task returned %v, want ErrNotFound", err)
+	}
+
+	// Once the lease has been reaped, the old worker must not be able to
+	// resurrect it — that is how two workers would end up both "owning" it.
+	st.SetClock(func() time.Time { return time.Now().UTC().Add(time.Hour) })
+	if _, err := st.ReapExpiredLeases(); err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+	if _, err := st.RenewLease(created.ID, token, time.Minute); !errors.Is(err, ErrNotRunning) {
+		t.Errorf("renewing a reaped task returned %v, want ErrNotRunning", err)
+	}
+}
+
 func TestLeaseNotExpiredIsLeftAlone(t *testing.T) {
 	st := newTestStore(t)
 	worker := mustRegisterWorker(t, st)

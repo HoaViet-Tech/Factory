@@ -263,6 +263,41 @@ func checkLease(tx *sql.Tx, id, token string) (api.Task, error) {
 	return t, nil
 }
 
+// RenewLease extends a running task's lease.
+//
+// This is what makes long agent runs safe. A worker renews on a timer while it
+// works; if it dies, renewals stop, the lease expires, and the reaper requeues
+// the task. Without renewal the reaper cannot tell "still working" from
+// "dead", and a slow task gets executed twice concurrently.
+func (s *Store) RenewLease(id, leaseToken string, extendBy time.Duration) (api.Task, error) {
+	if extendBy <= 0 {
+		extendBy = 2 * time.Minute
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return api.Task{}, err
+	}
+	defer tx.Rollback()
+
+	// checkLease enforces both "is running" and "owns the lease", so a worker
+	// whose lease was already reaped cannot resurrect it.
+	if _, err := checkLease(tx, id, leaseToken); err != nil {
+		return api.Task{}, err
+	}
+
+	now := s.Now()
+	expires := now.Add(extendBy)
+	if _, err := tx.Exec(`UPDATE tasks SET lease_expires_at = ?, updated_at = ? WHERE id = ?`,
+		formatTime(expires), formatTime(now), id); err != nil {
+		return api.Task{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return api.Task{}, err
+	}
+	return s.GetTask(id)
+}
+
 // CompleteTask moves a running task into a terminal state. The caller must
 // present the lease token it was given at claim time.
 func (s *Store) CompleteTask(id, leaseToken, status, message string) (api.Task, error) {

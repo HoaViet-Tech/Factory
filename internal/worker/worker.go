@@ -39,6 +39,11 @@ type Config struct {
 	Runtime agentruntime.Runtime
 	// GitHub may be nil to disable all GitHub side effects.
 	GitHub *githubcli.Client
+	// LocalOnly records that the operator *chose* to run without GitHub
+	// (--no-github). Without this flag the worker cannot tell "deliberately
+	// offline" from "gh is broken", and issue-triggered tasks would silently
+	// succeed without ever updating the issue.
+	LocalOnly bool
 	// Push publishes the task branch and opens a draft PR when the agent
 	// produced changes. Off by default: pushing is a visible, outward action.
 	Push bool
@@ -82,7 +87,9 @@ func New(cfg Config) (*Worker, error) {
 		cfg.HeartbeatInterval = 20 * time.Second
 	}
 	if cfg.LeaseSeconds <= 0 {
-		cfg.LeaseSeconds = 120
+		// Long enough that a brief network blip does not lose the lease, and
+		// renewed at a third of this interval while work is in progress.
+		cfg.LeaseSeconds = 300
 	}
 	if cfg.TaskTimeout <= 0 {
 		cfg.TaskTimeout = 30 * time.Minute
@@ -208,9 +215,11 @@ func (w *Worker) runTask(ctx context.Context, task api.Task, lease string) {
 	taskCtx, cancel := context.WithTimeout(ctx, w.cfg.TaskTimeout)
 	defer cancel()
 
-	// A lease renewal loop would be the next step for very long tasks; for the
-	// MVP the lease is simply set long enough, and an over-run is reaped and
-	// retried.
+	// Renew the lease while we work. Without this the reaper cannot tell a
+	// slow agent from a dead one, and a task that outlives its lease would be
+	// handed to a second worker while this one is still editing files.
+	lost := w.startRenewals(taskCtx, task.ID, lease, cancel)
+
 	status, summary := api.StatusSucceeded, ""
 	result, err := w.execute(taskCtx, task, logf)
 	if err != nil {
@@ -221,11 +230,59 @@ func (w *Worker) runTask(ctx context.Context, task api.Task, lease string) {
 		summary = result.Summary
 	}
 
+	// If the lease was lost, the task already belongs to someone else.
+	// Completing it would either fail or stomp on their result.
+	select {
+	case <-lost:
+		w.logger.Printf("task %s: lease lost, abandoning without completing (another worker owns it now)", task.ID)
+		return
+	default:
+	}
+
 	if _, err := w.api.Complete(task.ID, lease, status, summary); err != nil {
 		w.logger.Printf("could not complete task %s: %v", task.ID, err)
 		return
 	}
 	w.logger.Printf("task %s -> %s", task.ID, status)
+}
+
+// startRenewals keeps the lease alive until ctx ends. If the server says the
+// lease is gone, it cancels ctx (stopping the runtime) and closes the returned
+// channel.
+func (w *Worker) startRenewals(ctx context.Context, taskID, lease string, cancel context.CancelFunc) <-chan struct{} {
+	lost := make(chan struct{})
+
+	// Renew comfortably before expiry so one slow or failed call is survivable.
+	interval := time.Duration(w.cfg.LeaseSeconds) * time.Second / 3
+	if interval < 5*time.Second {
+		interval = 5 * time.Second
+	}
+
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				err := w.api.RenewLease(taskID, lease, w.cfg.LeaseSeconds)
+				if err == nil {
+					continue
+				}
+				if errors.Is(err, client.ErrLeaseLost) {
+					w.logger.Printf("task %s: lease lost (%v); stopping work", taskID, err)
+					close(lost)
+					cancel()
+					return
+				}
+				// A transient network error is not proof the lease is gone;
+				// keep trying until it either recovers or the lease expires.
+				w.logger.Printf("task %s: lease renewal failed, will retry: %v", taskID, err)
+			}
+		}
+	}()
+	return lost
 }
 
 // taskLogger returns a logger that writes to both the local console and the
@@ -253,15 +310,35 @@ func (w *Worker) execute(ctx context.Context, task api.Task, logf func(string, s
 	// snapshot taken at poll time may be minutes old and a human may have
 	// changed their mind since.
 	var issue *githubcli.Issue
-	if task.GitHubIssueNumber != nil && w.cfg.GitHub != nil {
-		iss, skip, err := w.revalidateIssue(task, logf)
-		if err != nil {
-			return agentruntime.Result{}, err
+	if task.GitHubIssueNumber != nil {
+		switch {
+		case w.cfg.GitHub != nil:
+			iss, skip, err := w.revalidateIssue(task, logf)
+			if err != nil {
+				return agentruntime.Result{}, err
+			}
+			if skip != "" {
+				return agentruntime.Result{Summary: skip}, nil
+			}
+			issue = iss
+
+		case w.cfg.LocalOnly:
+			// The operator explicitly asked for no GitHub interaction, so
+			// running without publishing is what they wanted. Say so loudly
+			// in the task log rather than letting it look like a full success.
+			logf(api.EventWarn,
+				"local-only mode: issue #%d will NOT be commented on or relabelled",
+				*task.GitHubIssueNumber)
+
+		default:
+			// Silently succeeding here would be the worst outcome: the task
+			// looks done, but the issue is never updated and the label still
+			// says it is waiting.
+			return agentruntime.Result{}, fmt.Errorf(
+				"task is for issue #%d but the gh CLI is unavailable, so the issue could not be updated; "+
+					"authenticate with `gh auth login`, or pass --no-github to run local-only on purpose",
+				*task.GitHubIssueNumber)
 		}
-		if skip != "" {
-			return agentruntime.Result{Summary: skip}, nil
-		}
-		issue = iss
 	}
 
 	gitLog := func(format string, args ...any) { logf(api.EventLog, format, args...) }
@@ -279,8 +356,8 @@ func (w *Worker) execute(ctx context.Context, task api.Task, logf func(string, s
 	}
 	baseRef := cache.BaseRef(defaultBranch)
 
-	branch := "factory/task-" + task.ID
-	worktreeDir := filepath.Join(w.cfg.WorkDir, "worktrees", task.ID)
+	branch := BranchName(task)
+	worktreeDir := w.worktreeDir(task)
 	logf(api.EventInfo, "creating worktree %s on branch %s (from %s)", worktreeDir, branch, baseRef)
 
 	wt, err := cache.AddWorktree(worktreeDir, branch, baseRef)
@@ -337,6 +414,32 @@ func (w *Worker) execute(ctx context.Context, task api.Task, logf func(string, s
 	}
 	logf(api.EventInfo, "worktree left at %s for inspection", worktreeDir)
 	return result, nil
+}
+
+// BranchName returns the git branch for one *attempt* at a task.
+//
+// The attempt number matters. A retry reuses the task ID, so without it the
+// second attempt would try to create a branch that already exists and a
+// worktree in a directory that is already occupied — and fail before the agent
+// ever runs. Attempt-scoping also keeps a failed attempt's work around for
+// inspection instead of overwriting it.
+func BranchName(task api.Task) string {
+	return fmt.Sprintf("factory/task-%s-attempt-%d", task.ID, attemptNumber(task))
+}
+
+// worktreeDir returns the isolated checkout path for one attempt at a task.
+func (w *Worker) worktreeDir(task api.Task) string {
+	return filepath.Join(w.cfg.WorkDir, "worktrees", task.ID,
+		fmt.Sprintf("attempt-%d", attemptNumber(task)))
+}
+
+// attemptNumber defends against a zero count, so paths never collide even if a
+// task arrives without one.
+func attemptNumber(task api.Task) int {
+	if task.AttemptCount < 1 {
+		return 1
+	}
+	return task.AttemptCount
 }
 
 // repoForTask finds the registered repository for a task.

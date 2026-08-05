@@ -20,6 +20,10 @@ import (
 // ErrNoTask is returned by Claim when the queue is empty.
 var ErrNoTask = errors.New("no task available")
 
+// ErrLeaseLost is returned by RenewLease when this worker no longer owns the
+// task. The only correct response is to stop working on it.
+var ErrLeaseLost = errors.New("lease lost")
+
 // Client talks to one control plane server.
 type Client struct {
 	BaseURL string
@@ -179,6 +183,22 @@ func (c *Client) AppendEvent(taskID, leaseToken, evType, message string) error {
 	_, err := c.do(http.MethodPost, "/tasks/"+taskID+"/events",
 		api.AppendEventRequest{LeaseToken: leaseToken, Type: evType, Message: message}, nil)
 	return err
+}
+
+// RenewLease extends the lease on a task this worker is still running.
+//
+// It returns ErrLeaseLost when the server says the lease is no longer ours,
+// which means another worker has taken the task and this one must stop.
+func (c *Client) RenewLease(taskID, leaseToken string, leaseSeconds int) error {
+	code, err := c.do(http.MethodPost, "/tasks/"+taskID+"/renew",
+		api.RenewLeaseRequest{LeaseToken: leaseToken, LeaseSeconds: leaseSeconds}, nil)
+	if err != nil {
+		if code == http.StatusConflict || code == http.StatusNotFound {
+			return fmt.Errorf("%w: %v", ErrLeaseLost, err)
+		}
+		return err
+	}
+	return nil
 }
 
 // Complete finishes a task.

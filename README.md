@@ -141,7 +141,15 @@ If the binary is missing, the worker refuses to start and tells you to use
 - **GitHub-triggered tasks are deduplicated** by a unique key, so polling the
   same issue a hundred times creates exactly one task.
 - **Leases** mean a dead worker cannot hold a task forever: an expired lease is
-  requeued, and after 3 attempts the task is marked `lost`.
+  requeued, and after 3 attempts the task is marked `lost`. A working worker
+  **renews** its lease on a timer, so a slow agent is never mistaken for a dead
+  one and handed to a second worker.
+- **Each attempt is isolated.** A retry gets its own branch and worktree
+  (`factory/task-<id>-attempt-<n>`), so it never collides with the leftovers of
+  the attempt that failed.
+- **Issue-triggered tasks fail loudly if GitHub is unreachable**, rather than
+  reporting success while the issue is never updated. Pass `--no-github` when
+  you mean it.
 - **Pushing is opt-in** (`--push`), and dry-run mode (`--github-dry-run`) logs
   every GitHub write instead of performing it.
 
@@ -160,6 +168,7 @@ If the binary is missing, the worker refuses to start and tells you to use
 | GET | `/workers` | List workers |
 | POST | `/tasks/claim` | Claim a task (204 when the queue is empty) |
 | POST | `/tasks/{id}/events` | Append a log line (lease required) |
+| POST | `/tasks/{id}/renew` | Extend the lease while working (lease required) |
 | POST | `/tasks/{id}/complete` | Finish a task (lease required) |
 | POST | `/repositories` | Register a repository |
 | GET | `/repositories` | List repositories |

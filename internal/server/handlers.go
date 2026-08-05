@@ -186,6 +186,32 @@ func (s *Server) handleAppendEvent(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// handleRenewLease extends the lease of a task a worker is still running.
+func (s *Server) handleRenewLease(w http.ResponseWriter, r *http.Request) {
+	var req api.RenewLeaseRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.LeaseToken == "" {
+		writeErr(w, http.StatusBadRequest, "lease_token is required")
+		return
+	}
+
+	lease := s.cfg.DefaultLease
+	if req.LeaseSeconds > 0 {
+		lease = time.Duration(req.LeaseSeconds) * time.Second
+	}
+
+	task, err := s.store.RenewLease(r.PathValue("id"), req.LeaseToken, lease)
+	if err != nil {
+		// A 409 here tells the worker its lease is gone and it should stop
+		// working, rather than racing whoever picked the task up next.
+		writeStoreErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, task)
+}
+
 func (s *Server) handleCompleteTask(w http.ResponseWriter, r *http.Request) {
 	var req api.CompleteTaskRequest
 	if !decode(w, r, &req) {

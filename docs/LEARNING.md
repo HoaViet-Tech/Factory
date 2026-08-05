@@ -89,9 +89,19 @@ expired leases, and gives up after N attempts by marking the task `lost`.
   minutes forward instead of sleeping.
 - Requeuing forever. A task that crashes its worker three times will crash the
   fourth. Cap it.
+- **Shipping expiry without renewal.** This one bit this repository. If the
+  worker never renews, the reaper cannot tell a slow agent from a dead one, so
+  any task outliving its lease is requeued and run a *second time* while the
+  first agent is still editing files. Add `POST /tasks/{id}/renew` in the same
+  milestone as expiry, and have the worker cancel its runtime when a renewal
+  comes back 409.
+- **Retrying onto the same branch and directory.** A retry reuses the task ID.
+  Scope the branch and worktree by attempt number, or attempt 2 dies in
+  `git worktree add` before the agent runs and the task is stuck forever.
 
 **Test:** completing with the wrong token fails; an expired lease returns to
-`queued`; after `MaxAttempts` it becomes `lost`.
+`queued`; after `MaxAttempts` it becomes `lost`; a renewed task is *never*
+reaped; and a retry after an abandoned attempt runs to completion.
 
 **Prove it:** start a worker, `Ctrl-C` it mid-task, and watch the server log
 `lease expired: task ... -> queued`.

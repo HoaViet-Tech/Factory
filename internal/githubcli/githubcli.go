@@ -140,12 +140,21 @@ func (c *Client) run(stdin string, args ...string) (string, error) {
 // Available checks that gh exists and is authenticated. Call it once at
 // startup so failures surface early with an actionable message rather than
 // halfway through a task.
+//
+// Note that --github-dry-run does NOT relax these requirements: dry-run only
+// skips *writes*. Reading issues still needs an authenticated gh. To work with
+// no GitHub at all, use the fake runtime with a local repository (see
+// docs/DEMO.md) or pass --no-github to the worker.
 func (c *Client) Available() error {
 	if _, err := exec.LookPath(c.bin()); err != nil {
-		return fmt.Errorf("%w: %q not found in PATH (install https://cli.github.com/ or run with --dry-run)", ErrUnavailable, c.bin())
+		return fmt.Errorf("%w: %q not found in PATH; install https://cli.github.com/ "+
+			"(note: --github-dry-run still needs gh, because reading issues is a real API call)",
+			ErrUnavailable, c.bin())
 	}
 	if _, err := c.run("", "auth", "status"); err != nil {
-		return fmt.Errorf("%w: not authenticated; run `gh auth login` (or use --dry-run): %v", ErrUnavailable, err)
+		return fmt.Errorf("%w: gh is installed but not authenticated; run `gh auth login` "+
+			"(note: --github-dry-run still needs authentication, because it only skips writes, not reads): %v",
+			ErrUnavailable, err)
 	}
 	return nil
 }

@@ -183,6 +183,17 @@ type ClaimResponse struct {
 	LeaseToken string `json:"lease_token"`
 }
 
+// RenewLeaseRequest is the body of POST /tasks/{id}/renew.
+//
+// A worker renews while it is still working. Without this, any task that
+// outlives its lease gets requeued and executed a second time while the first
+// agent is still editing files.
+type RenewLeaseRequest struct {
+	LeaseToken string `json:"lease_token"`
+	// LeaseSeconds is optional; the server applies its default when zero.
+	LeaseSeconds int `json:"lease_seconds,omitempty"`
+}
+
 // AppendEventRequest is the body of POST /tasks/{id}/events.
 type AppendEventRequest struct {
 	LeaseToken string `json:"lease_token"`

@@ -90,6 +90,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /tasks/{id}/cancel", s.handleCancelTask)
 	s.mux.HandleFunc("GET /tasks/{id}/events", s.handleListEvents)
 	s.mux.HandleFunc("POST /tasks/{id}/events", s.handleAppendEvent)
+	s.mux.HandleFunc("POST /tasks/{id}/renew", s.handleRenewLease)
 	s.mux.HandleFunc("POST /tasks/{id}/complete", s.handleCompleteTask)
 
 	// Workers

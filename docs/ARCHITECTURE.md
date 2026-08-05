@@ -59,6 +59,28 @@ worker has since picked up.
 recovery story, and it needs no supervisor, no heartbeat timeout logic in the
 queue, and no distributed lock.
 
+**Renewal is what makes this safe for slow agents.** A worker calls
+`POST /tasks/{id}/renew` every third of its lease while it works. Without that,
+the reaper cannot distinguish "still working" from "dead", so any task
+outliving its lease would be requeued and run *concurrently* by a second
+worker while the first is still editing files. If a renewal comes back 409, the
+worker has lost the task: it cancels the running agent and does not complete
+the task, because it no longer owns it.
+
+Note the ordering guarantee: `RenewLease` goes through the same `checkLease`
+as completion, so a worker whose lease was already reaped cannot resurrect it.
+
+### Attempts are isolated, not just tasks
+
+A retry reuses the task ID, so branch and worktree names are scoped by
+**attempt**: `factory/task-<id>-attempt-<n>` in
+`<work-dir>/worktrees/<task-id>/attempt-<n>`.
+
+Without that scoping, attempt 2 would try to create a branch that already
+exists and a worktree in an occupied directory, and would fail before the agent
+ever ran — turning one flaky attempt into a permanently stuck task. Keeping
+each attempt separate also preserves the failed attempt's work for inspection.
+
 ### Dedupe: the second core idea
 
 Polling is at-least-once. Task creation must be exactly-once.
@@ -154,7 +176,17 @@ and every call is a command you could have typed yourself. Debugging is
 `gh issue view 5 --json labels`, not a webhook replay.
 
 Read calls always execute. Write calls are skipped and logged in
-`--github-dry-run` mode.
+`--github-dry-run` mode. **Dry-run is not an offline mode** — reading issues is
+a real API call, so it still needs an authenticated `gh`. For genuinely
+credential-free work, use the fake runtime against a local repository
+(`docs/DEMO.md`).
+
+If a task carries a `github_issue_number` but no GitHub client is available,
+the task **fails** rather than succeeding without updating the issue. The
+alternative — a green task next to an issue still labelled `factory:inbox` —
+is the kind of silent divergence that destroys trust in an automation. Passing
+`--no-github` opts into local-only execution deliberately, and the task log
+warns that the issue was not touched.
 
 Responsibility split:
 
@@ -209,7 +241,6 @@ every GitHub mutation, the label is checked live first.
 
 | Not built | Why |
 |---|---|
-| Lease renewal mid-task | Long tasks just use a longer lease; renewal is the natural next step |
 | Auth on the API | It binds to 127.0.0.1; add auth before it ever leaves localhost |
 | Multi-node | `SetMaxOpenConns(1)` and a local file assume one machine |
 | Automatic merging | A human reviews. Always. |

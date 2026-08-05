@@ -25,11 +25,11 @@ func runWorker(args []string) error {
 	runtimeStdin := fs.Bool("runtime-stdin", false, "feed the prompt to the runtime command on stdin")
 	workDir := fs.String("work-dir", ".factory", "directory for the repo cache, worktrees and worker id")
 	push := fs.Bool("push", false, "push the task branch and open a draft PR when the agent produces changes")
-	dryRun := fs.Bool("github-dry-run", false, "log GitHub writes instead of performing them")
-	noGitHub := fs.Bool("no-github", false, "disable all GitHub interaction, even for issue-triggered tasks")
+	dryRun := fs.Bool("github-dry-run", false, "log GitHub writes instead of performing them (still needs an authenticated gh for reads)")
+	noGitHub := fs.Bool("no-github", false, "run local-only: never touch GitHub, even for issue-triggered tasks")
 	once := fs.Bool("once", false, "exit after finishing one task (or immediately if the queue is empty)")
 	taskTimeout := fs.Duration("task-timeout", 30*time.Minute, "maximum runtime duration for a single task")
-	leaseSeconds := fs.Int("lease-seconds", 120, "requested lease duration in seconds")
+	leaseSeconds := fs.Int("lease-seconds", 300, "requested lease duration in seconds (renewed automatically every third of this while a task runs)")
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Run a worker that claims tasks and executes them in isolated git worktrees.\n\nUsage: codefactory worker [flags]\n\nFlags:\n")
 		fs.PrintDefaults()
@@ -69,6 +69,7 @@ func runWorker(args []string) error {
 		WorkDir:      *workDir,
 		Runtime:      rt,
 		GitHub:       gh,
+		LocalOnly:    *noGitHub,
 		Push:         *push,
 		Once:         *once,
 		TaskTimeout:  *taskTimeout,

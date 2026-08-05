@@ -110,7 +110,7 @@ func TestWorkerEndToEndWithFakeRuntime(t *testing.T) {
 	}
 
 	// 3. The isolated worktree exists and contains the agent's change.
-	worktree := filepath.Join(workDir, "worktrees", task.ID)
+	worktree := filepath.Join(workDir, "worktrees", task.ID, "attempt-1")
 	if _, err := os.Stat(filepath.Join(worktree, ".factory-task.md")); err != nil {
 		t.Errorf("prompt file missing from the worktree: %v", err)
 	}
@@ -121,11 +121,244 @@ func TestWorkerEndToEndWithFakeRuntime(t *testing.T) {
 
 	// 4. The change is on its own branch, and the source repo is untouched.
 	branch := gitOutput(t, worktree, "rev-parse", "--abbrev-ref", "HEAD")
-	if branch != "factory/task-"+task.ID {
-		t.Errorf("worktree branch = %q, want factory/task-%s", branch, task.ID)
+	want := "factory/task-" + task.ID + "-attempt-1"
+	if branch != want {
+		t.Errorf("worktree branch = %q, want %q", branch, want)
 	}
 	if status := gitOutput(t, sourceRepo, "status", "--porcelain"); status != "" {
 		t.Errorf("the source repository was modified: %q", status)
+	}
+}
+
+// TestRetryAfterAbandonedAttemptSucceeds is the regression test for the bug
+// where a retry reused the first attempt's branch and worktree directory, so
+// the second attempt died in `git worktree add` before the agent ever ran.
+func TestRetryAfterAbandonedAttemptSucceeds(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed")
+	}
+
+	sourceRepo := newGitRepo(t)
+
+	st, err := store.Open(filepath.Join(t.TempDir(), "retry.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	ts := httptest.NewServer(server.New(server.Config{Store: st, DefaultLease: time.Minute}).Handler())
+	defer ts.Close()
+
+	c := client.New(ts.URL)
+	if _, err := c.AddRepository(api.CreateRepositoryRequest{
+		Owner: "local", Name: "demo", CloneURL: sourceRepo,
+	}); err != nil {
+		t.Fatalf("add repository: %v", err)
+	}
+	task, err := c.CreateTask(api.CreateTaskRequest{
+		RepoOwner: "local", RepoName: "demo", Title: "retried task", Prompt: "work",
+	})
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+
+	// One shared work dir: the retry must cope with the first attempt's
+	// leftovers, which is the whole point.
+	workDir := t.TempDir()
+	newWorker := func() *Worker {
+		w, err := New(Config{
+			ServerURL: ts.URL, Name: "test-worker", WorkDir: workDir,
+			Runtime: agentruntime.FakeRuntime{}, Once: true, Logger: testLogger(t),
+		})
+		if err != nil {
+			t.Fatalf("new worker: %v", err)
+		}
+		return w
+	}
+
+	// Attempt 1 runs and leaves a worktree and a branch behind.
+	if err := newWorker().Run(context.Background()); err != nil {
+		t.Fatalf("first attempt: %v", err)
+	}
+	firstWorktree := filepath.Join(workDir, "worktrees", task.ID, "attempt-1")
+	if _, err := os.Stat(firstWorktree); err != nil {
+		t.Fatalf("the first attempt should have left a worktree: %v", err)
+	}
+
+	// Put the task back on the queue exactly as the lease reaper would after
+	// an abandoned attempt: queued again, attempt_count preserved.
+	if _, err := st.DB().Exec(
+		`UPDATE tasks SET status = ?, worker_id = NULL, lease_token = NULL, lease_expires_at = NULL WHERE id = ?`,
+		api.StatusQueued, task.ID,
+	); err != nil {
+		t.Fatalf("requeue task: %v", err)
+	}
+
+	// Attempt 2 must run to completion rather than tripping over attempt 1.
+	if err := newWorker().Run(context.Background()); err != nil {
+		t.Fatalf("second attempt: %v", err)
+	}
+
+	done, err := c.GetTask(task.ID)
+	if err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	if done.Status != api.StatusSucceeded {
+		events, _ := c.ListEvents(task.ID)
+		for _, e := range events {
+			t.Logf("event %s: %s", e.Type, e.Message)
+		}
+		t.Fatalf("retry status = %q, want succeeded", done.Status)
+	}
+	if done.AttemptCount != 2 {
+		t.Fatalf("attempt count = %d, want 2", done.AttemptCount)
+	}
+
+	// Both attempts survive on disk, on separate branches, for inspection.
+	secondWorktree := filepath.Join(workDir, "worktrees", task.ID, "attempt-2")
+	if _, err := os.Stat(secondWorktree); err != nil {
+		t.Fatalf("the retry should have its own worktree: %v", err)
+	}
+	if _, err := os.Stat(firstWorktree); err != nil {
+		t.Errorf("the first attempt's worktree should be preserved: %v", err)
+	}
+
+	branch := gitOutput(t, secondWorktree, "rev-parse", "--abbrev-ref", "HEAD")
+	if want := "factory/task-" + task.ID + "-attempt-2"; branch != want {
+		t.Errorf("retry branch = %q, want %q", branch, want)
+	}
+}
+
+// TestIssueTaskFailsWhenGitHubIsUnavailable is the regression test for the bug
+// where an issue-triggered task reported success without ever commenting on or
+// relabelling the issue.
+func TestIssueTaskFailsWhenGitHubIsUnavailable(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed")
+	}
+
+	sourceRepo := newGitRepo(t)
+
+	st, err := store.Open(filepath.Join(t.TempDir(), "nogh.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	ts := httptest.NewServer(server.New(server.Config{Store: st, DefaultLease: time.Minute}).Handler())
+	defer ts.Close()
+
+	c := client.New(ts.URL)
+	if _, err := c.AddRepository(api.CreateRepositoryRequest{
+		Owner: "local", Name: "demo", CloneURL: sourceRepo,
+	}); err != nil {
+		t.Fatalf("add repository: %v", err)
+	}
+
+	issue := 7
+	task, err := c.CreateTask(api.CreateTaskRequest{
+		Kind: api.KindImplementTicket, RepoOwner: "local", RepoName: "demo",
+		GitHubIssueNumber: &issue, Title: "from an issue", Prompt: "work",
+	})
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+
+	// GitHub is nil and LocalOnly is false: gh is simply broken or missing.
+	w, err := New(Config{
+		ServerURL: ts.URL, Name: "test-worker", WorkDir: t.TempDir(),
+		Runtime: agentruntime.FakeRuntime{}, Once: true, Logger: testLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("new worker: %v", err)
+	}
+	if err := w.Run(context.Background()); err != nil {
+		t.Fatalf("worker run: %v", err)
+	}
+
+	done, err := c.GetTask(task.ID)
+	if err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	if done.Status != api.StatusFailed {
+		t.Fatalf("status = %q, want failed: an issue-triggered task must not "+
+			"report success when the issue was never updated", done.Status)
+	}
+
+	events, _ := c.ListEvents(task.ID)
+	var explained bool
+	for _, e := range events {
+		if strings.Contains(e.Message, "gh CLI is unavailable") && strings.Contains(e.Message, "--no-github") {
+			explained = true
+		}
+	}
+	if !explained {
+		t.Error("the failure should name the cause and the --no-github escape hatch")
+	}
+}
+
+// TestLocalOnlyRunsIssueTaskWithAWarning covers the deliberate offline case:
+// the operator asked for it, so the task runs, but the log says plainly that
+// GitHub was not updated.
+func TestLocalOnlyRunsIssueTaskWithAWarning(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed")
+	}
+
+	sourceRepo := newGitRepo(t)
+
+	st, err := store.Open(filepath.Join(t.TempDir(), "localonly.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	ts := httptest.NewServer(server.New(server.Config{Store: st, DefaultLease: time.Minute}).Handler())
+	defer ts.Close()
+
+	c := client.New(ts.URL)
+	if _, err := c.AddRepository(api.CreateRepositoryRequest{
+		Owner: "local", Name: "demo", CloneURL: sourceRepo,
+	}); err != nil {
+		t.Fatalf("add repository: %v", err)
+	}
+	issue := 8
+	task, err := c.CreateTask(api.CreateTaskRequest{
+		Kind: api.KindImplementTicket, RepoOwner: "local", RepoName: "demo",
+		GitHubIssueNumber: &issue, Title: "offline on purpose", Prompt: "work",
+	})
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+
+	w, err := New(Config{
+		ServerURL: ts.URL, Name: "test-worker", WorkDir: t.TempDir(),
+		Runtime: agentruntime.FakeRuntime{}, Once: true, LocalOnly: true, Logger: testLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("new worker: %v", err)
+	}
+	if err := w.Run(context.Background()); err != nil {
+		t.Fatalf("worker run: %v", err)
+	}
+
+	done, err := c.GetTask(task.ID)
+	if err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	if done.Status != api.StatusSucceeded {
+		t.Fatalf("status = %q, want succeeded in local-only mode", done.Status)
+	}
+
+	events, _ := c.ListEvents(task.ID)
+	var warned bool
+	for _, e := range events {
+		if e.Type == api.EventWarn && strings.Contains(e.Message, "local-only") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Error("local-only mode should warn that the issue was not updated")
 	}
 }
 

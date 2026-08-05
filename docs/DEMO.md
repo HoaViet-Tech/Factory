@@ -177,6 +177,10 @@ can write to.
 **Start with `--github-dry-run` on both processes.** Reads happen, writes are
 logged instead of performed.
 
+> `--github-dry-run` is not an offline mode. Reading issues is a real API call,
+> so it still needs an authenticated `gh`. Demo 1 above is the credential-free
+> path.
+
 ### 1. Create the labels
 
 ```bash
@@ -268,6 +272,18 @@ and watch the server reap the lease and requeue the task:
 ```
 [server] lease expired: task a1b2c3d4e5f6 -> queued
 ```
+
+Then run a worker again: the retry gets `attempt-2` paths, and the abandoned
+`attempt-1` worktree is still there to inspect.
+
+**Watch a long task keep its lease.** Run something slower than the lease:
+
+```bash
+./codefactory worker --runtime shell --runtime-command "sleep 400" --lease-seconds 60
+```
+
+The worker renews every 20s and the task is never reaped. Before renewal
+existed, this task would have been requeued and run twice concurrently.
 
 **Run two workers at once.** Each gets its own worktree; neither sees the
 other's files.
