@@ -55,9 +55,10 @@ func (c *Client) do(method, path string, body, out any) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
+	// Always declare JSON, even for bodyless POSTs like cancel and poll: the
+	// server requires it on every state-changing request as a CSRF guard, and
+	// browsers cannot send it cross-origin without a preflight.
+	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {

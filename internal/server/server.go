@@ -76,7 +76,12 @@ func New(cfg Config) *Server {
 }
 
 // Handler exposes the router, which is all the tests need.
-func (s *Server) Handler() http.Handler { return s.logRequests(s.mux) }
+//
+// The browser guard sits inside the access log, so a refused request still
+// shows up in the log where you can see it.
+func (s *Server) Handler() http.Handler {
+	return s.logRequests(s.guardBrowserRequests(s.mux))
+}
 
 func (s *Server) routes() {
 	// Health

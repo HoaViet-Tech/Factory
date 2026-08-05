@@ -135,6 +135,37 @@ place, so every handler reports failures identically:
 An empty queue returns **204**, not an error — idle is the normal case for a
 polling worker, and it should not look like a failure in the logs.
 
+### Two guards that are not authentication
+
+The API is unauthenticated by design (see "Remote access" in the README). Two
+checks still sit in front of it, because they close paths that do not need a
+stolen credential at all.
+
+**The browser guard** (`browserguard.go`). Cross-site request forgery survives
+every network control in this project: a tunnel or a firewall keeps other
+machines out, but the browser on the same machine is already inside. Any page
+you visit can make your browser POST to `127.0.0.1:7337`; it cannot read the
+reply, but the task is created regardless.
+
+So state-changing requests must carry `Content-Type: application/json` and must
+not carry a foreign `Origin`. Browsers cannot send a JSON body cross-origin
+without a CORS preflight, which nothing here answers, and they always stamp
+`Origin` on cross-site requests while CLIs never do. GET is deliberately left
+open: it changes nothing, and keeping the API browsable by hand is useful.
+
+**Clone URL validation** (`api/cloneurl.go`). `git clone` accepts inputs that
+are not addresses:
+
+- `ext::sh -c '...'` is git's remote-helper syntax and *runs a command*.
+- `--upload-pack=...` starts with a dash, so git reads it as a flag.
+
+Either turns "register a repository" into "execute this". Validation happens in
+`AddRepository`, so a bad URL never reaches the database, let alone git.
+
+Neither guard is a substitute for the network boundary. They close the two
+routes that work without any credential; the boundary is what stops everything
+else.
+
 ## 3. The worker — `internal/worker`
 
 The loop is five lines of intent: register → heartbeat → claim → execute →

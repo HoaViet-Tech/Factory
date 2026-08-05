@@ -198,6 +198,12 @@ If the binary is missing, the worker refuses to start and tells you to use
   you mean it.
 - **Pushing is opt-in** (`--push`), and dry-run mode (`--github-dry-run`) logs
   every GitHub write instead of performing it.
+- **Web pages cannot drive the control plane.** State-changing requests must be
+  `application/json` and must not carry a foreign `Origin`, so a page you visit
+  cannot POST tasks to your own localhost.
+- **Clone URLs are validated.** `git clone` accepts inputs that are really
+  commands — `ext::sh -c ...` runs a shell, and a leading `-` becomes a git
+  flag. Both are rejected before they reach git.
 
 ## Remote access
 
@@ -238,6 +244,25 @@ Rules of thumb:
 - Run workers on the same host as the repositories they build.
 - If you ever do need real exposure, put a reverse proxy with TLS **and**
   authentication in front of it. A bearer token over plain HTTP is not enough.
+
+### The threat a tunnel does not stop
+
+A tunnel keeps other *machines* away from the control plane. It does nothing
+about the browser on the same machine: any page you visit can make your browser
+POST to `127.0.0.1:7337`, and the page never needs to read the reply for the
+task to be created.
+
+That is why state-changing requests must send `Content-Type: application/json`
+and must not carry a cross-origin `Origin` header. Browsers cannot send JSON
+cross-origin without asking permission first, and this server never grants it.
+The CLI and workers are unaffected — they already send exactly that.
+
+If you write your own client, send `Content-Type: application/json` on every
+POST and no `Origin` header:
+
+```bash
+curl -X POST -H 'Content-Type: application/json' -d '{"repo_owner":"you","repo_name":"repo","title":"hi","prompt":"hi"}' http://127.0.0.1:7337/tasks
+```
 
 ## API
 

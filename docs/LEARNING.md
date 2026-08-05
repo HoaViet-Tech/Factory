@@ -256,6 +256,16 @@ point — FIFO alone would hand it the wrong one.
 - **Auth.** The API trusts every caller, which is why it binds to loopback and
   is reached over a tunnel. If you ever want it genuinely exposed, that needs
   auth *and* TLS — not a token over plain HTTP.
+
+Two lessons from this repository worth stealing even if you build nothing else:
+
+- **A localhost-only API is still reachable from your own browser.** Require
+  `Content-Type: application/json` on state-changing requests and reject
+  foreign `Origin` headers. Fifteen lines, and it closes a hole that no
+  firewall or tunnel can.
+- **A URL you pass to a subprocess is an argument, not just a string.**
+  `git clone` treats `ext::sh -c '...'` as a command and a leading `-` as a
+  flag. Anything you hand to an external tool deserves the same suspicion.
 - **A real dashboard.** `GET /tasks` and `GET /tasks/{id}/events` are already
   enough to build one.
 

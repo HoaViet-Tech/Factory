@@ -18,6 +18,12 @@ func (s *Store) AddRepository(req api.CreateRepositoryRequest) (api.Repository, 
 	if cloneURL == "" {
 		cloneURL = "https://github.com/" + req.Owner + "/" + req.Name + ".git"
 	}
+	// The worker passes this straight to `git clone`, and git accepts inputs
+	// that are commands rather than addresses. Validate at the point of entry
+	// so a bad URL never reaches the database, let alone a shell.
+	if err := api.ValidateCloneURL(cloneURL); err != nil {
+		return api.Repository{}, err
+	}
 
 	enabled := true
 	if req.Enabled != nil {
