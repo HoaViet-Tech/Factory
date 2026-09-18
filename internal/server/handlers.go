@@ -274,7 +274,7 @@ func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
 			"GitHub polling is disabled: start the server with a working `gh` CLI, or use --github-dry-run")
 		return
 	}
-	resp, err := s.poller.PollOnce()
+	resp, err := s.pollOnce()
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return

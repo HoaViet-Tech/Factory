@@ -92,6 +92,25 @@ ALTER TABLE workers ADD COLUMN kinds TEXT NOT NULL DEFAULT '';
 ALTER TABLE tasks ADD COLUMN run_after TEXT NOT NULL DEFAULT '';
 `,
 	},
+	{
+		// One row per (issue, chat): the message the control plane already sent
+		// for that run, so the next update edits it instead of posting a second
+		// checklist. last_text is what we last published, which is how an
+		// unchanged run costs zero API calls.
+		Name: "0004_run_notifications",
+		SQL: `
+CREATE TABLE run_notifications (
+    repo_owner   TEXT NOT NULL,
+    repo_name    TEXT NOT NULL,
+    issue_number INTEGER NOT NULL,
+    channel      TEXT NOT NULL,
+    external_id  TEXT NOT NULL,
+    last_text    TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    PRIMARY KEY (repo_owner, repo_name, issue_number, channel)
+);
+`,
+	},
 }
 
 // migrate creates schema_migrations if needed and applies anything missing.

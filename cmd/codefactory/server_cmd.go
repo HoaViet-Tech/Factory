@@ -14,8 +14,10 @@ import (
 
 	"github.com/HoaViet-Tech/factory/internal/githubcli"
 	"github.com/HoaViet-Tech/factory/internal/ingest"
+	"github.com/HoaViet-Tech/factory/internal/progress"
 	"github.com/HoaViet-Tech/factory/internal/server"
 	"github.com/HoaViet-Tech/factory/internal/store"
+	"github.com/HoaViet-Tech/factory/internal/telegram"
 )
 
 func runServer(args []string) error {
@@ -26,9 +28,14 @@ func runServer(args []string) error {
 	pollInterval := fs.Duration("poll-interval", 0, "poll GitHub automatically on this interval (0 = only on demand via POST /github/poll)")
 	pollLimit := fs.Int("poll-limit", 30, "maximum issues read per label per repository")
 	leaseDuration := fs.Duration("lease", 2*time.Minute, "how long a claimed task stays leased to a worker")
+	progressInterval := fs.Duration("progress-interval", 10*time.Second, "how often the Telegram run checklist is refreshed")
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Run the control plane server.\n\nUsage: codefactory server [flags]\n\nFlags:\n")
 		fs.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\nEnvironment:\n"+
+			"  %s   bot token; enables live run checklists in Telegram\n"+
+			"  %s    chat or channel to post them into\n",
+			telegram.EnvToken, telegram.EnvChat)
 	}
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -55,14 +62,31 @@ func runServer(args []string) error {
 		logger.Printf("GitHub ingest enabled (dry-run=%v)", *dryRun)
 	}
 
+	// Telegram progress updates are opt-in through the environment. A typed nil
+	// must not reach the config: an interface holding one is not nil, and the
+	// server would start a progress loop that panics on its first tick.
+	var notifier progress.Notifier
+	tg, err := telegram.FromEnv()
+	if err != nil {
+		return fmt.Errorf("telegram configuration: %w", err)
+	}
+	if tg == nil {
+		logger.Printf("Telegram progress updates disabled: set %s and %s to enable them", telegram.EnvToken, telegram.EnvChat)
+	} else {
+		notifier = tg
+		logger.Printf("Telegram progress updates enabled (chat %s, every %s)", tg.ChatID, *progressInterval)
+	}
+
 	srv := server.New(server.Config{
-		Store:        st,
-		GitHub:       gh,
-		DryRun:       *dryRun,
-		DefaultLease: *leaseDuration,
-		PollInterval: *pollInterval,
-		PollLimit:    *pollLimit,
-		Logger:       logger,
+		Store:            st,
+		GitHub:           gh,
+		DryRun:           *dryRun,
+		DefaultLease:     *leaseDuration,
+		PollInterval:     *pollInterval,
+		PollLimit:        *pollLimit,
+		Notifier:         notifier,
+		ProgressInterval: *progressInterval,
+		Logger:           logger,
 	})
 
 	warnIfExposed(logger, *listen)

@@ -33,6 +33,33 @@ func (s *Store) AppendEvent(taskID, evType, message string) error {
 	return tx.Commit()
 }
 
+// ListTaskEventsOfType returns one kind of event for a task, oldest first.
+//
+// The progress checklist only cares about milestones. Reading them directly
+// keeps every agent log line out of a query that runs on a timer.
+func (s *Store) ListTaskEventsOfType(taskID, evType string) ([]api.TaskEvent, error) {
+	rows, err := s.db.Query(`SELECT id, task_id, type, message, created_at FROM task_events
+		WHERE task_id = ? AND type = ? ORDER BY id ASC`, taskID, evType)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	events := []api.TaskEvent{}
+	for rows.Next() {
+		var (
+			e         api.TaskEvent
+			createdAt string
+		)
+		if err := rows.Scan(&e.ID, &e.TaskID, &e.Type, &e.Message, &createdAt); err != nil {
+			return nil, err
+		}
+		e.CreatedAt = mustParseTime(createdAt)
+		events = append(events, e)
+	}
+	return events, rows.Err()
+}
+
 // ListTaskEvents returns a task's events oldest first, which is the order you
 // want when reading them as a log.
 func (s *Store) ListTaskEvents(taskID string, limit int) ([]api.TaskEvent, error) {

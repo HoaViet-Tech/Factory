@@ -120,7 +120,8 @@ forgets to ask.
 ## 2. The control plane — `internal/server`
 
 A `net/http.ServeMux` using Go 1.22+ method+pattern routing, a thin JSON
-layer, and two background loops (lease reaping, optional GitHub polling).
+layer, and three background loops (lease reaping, optional GitHub polling, and
+optional live progress updates).
 
 `writeStoreErr` maps the store's sentinel errors onto status codes in one
 place, so every handler reports failures identically:
@@ -165,6 +166,41 @@ Either turns "register a repository" into "execute this". Validation happens in
 Neither guard is a substitute for the network boundary. They close the two
 routes that work without any credential; the boundary is what stops everything
 else.
+
+### Live progress — `internal/progress`, `internal/telegram`
+
+A run is every task created for one GitHub issue: refine, then implement, then
+review. That is the unit a human watches, so it is the unit the checklist is
+rendered for — `store.RunRef` names it and `progress.Compute` answers each of
+its seven steps.
+
+Two decisions carry this design:
+
+**The checklist is derived, never stored.** Every tick recomputes it from the
+task rows and their `milestone` events. A restarted control plane, a reaped
+lease or a chat that was unreachable for ten minutes all heal on the next tick,
+because there is no separate progress state that can drift from the truth. The
+only thing persisted is the id of the message already sent (`run_notifications`),
+so an update edits it instead of posting a second checklist.
+
+**Side-effect steps are reported, not inferred.** "Refined spec posted" and
+"draft PR opened" are `api.EventMilestone` events the worker writes after the
+GitHub call returns. A task that succeeds is not proof that any of it happened:
+a refine task whose issue was closed under it also succeeds, having deliberately
+done nothing. Steps that are purely about task state — started, waiting — stay
+derived, so the worker only reports what only the worker can know.
+
+`progress.Notifier` is the whole contract with the outside world: `Channel`,
+`Send`, `Edit`. `internal/telegram` implements it over two Bot API calls and is
+the only package that knows Telegram exists. The loop compares each rendered
+checklist against the last published text, so a tick where nothing moved makes
+no API call at all.
+
+The bot token comes from the environment, never a flag: flag values are visible
+in `ps` output, and the token is what lets anyone post as the bot. It is also
+kept out of errors — the token sits in the request path, and `net/http` puts
+the whole URL into the error it returns, so one refused connection would
+otherwise print the credential straight into the server log.
 
 ## 3. The worker — `internal/worker`
 
