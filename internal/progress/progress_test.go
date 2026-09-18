@@ -143,3 +143,22 @@ func TestRenderMarkers(t *testing.T) {
 		}
 	}
 }
+
+func TestRenderIncludesNeedsHumanAndBlockedNotes(t *testing.T) {
+	got := Compute("owner/repo", 3, []TaskState{
+		task(api.KindRefineTicket, api.StatusSucceeded, 1,
+			StepSpecPosted,
+			NoteNeedsHuman+" choose the target chat"),
+		task(api.KindImplementTicket, api.StatusSucceeded, 1,
+			NoteBlocked+" no files changed"),
+	}).Render()
+
+	for _, want := range []string{
+		"needs human: choose the target chat",
+		"blocked: no files changed",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("render missing %q; got:\n%s", want, got)
+		}
+	}
+}

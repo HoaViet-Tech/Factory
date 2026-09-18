@@ -32,6 +32,9 @@ const (
 	StepDraftPR       = "draft PR opened"
 	StepReviewDone    = "review completed"
 	StepAwaitingHuman = "waiting for human approval"
+
+	NoteNeedsHuman = "needs human:"
+	NoteBlocked    = "blocked:"
 )
 
 // Order returns the checklist top to bottom.
@@ -84,6 +87,7 @@ type Run struct {
 	Repo   string // "owner/name"
 	Issue  int
 	States map[string]State
+	Notes  []string
 }
 
 // Compute answers every checklist step from the run's tasks.
@@ -108,6 +112,9 @@ func Compute(repo string, issue int, tasks []TaskState) Run {
 		}
 		for _, m := range ts.Milestones {
 			reached[m] = true
+			if isNote(m) {
+				r.Notes = append(r.Notes, m)
+			}
 		}
 		if !api.IsTerminal(ts.Task.Status) {
 			busy = true
@@ -155,6 +162,11 @@ func Compute(repo string, issue int, tasks []TaskState) Run {
 	return r
 }
 
+func isNote(m string) bool {
+	m = strings.ToLower(strings.TrimSpace(m))
+	return strings.HasPrefix(m, NoteNeedsHuman) || strings.HasPrefix(m, NoteBlocked)
+}
+
 func (r Run) anyFailed() bool {
 	for _, s := range r.States {
 		if s == Failed {
@@ -170,6 +182,9 @@ func (r Run) Render() string {
 	fmt.Fprintf(&b, "Factory: %s#%d", r.Repo, r.Issue)
 	for _, step := range Order() {
 		fmt.Fprintf(&b, "\n[%s] %s", marker(r.States[step]), step)
+	}
+	for _, note := range r.Notes {
+		fmt.Fprintf(&b, "\n%s", note)
 	}
 	return b.String()
 }

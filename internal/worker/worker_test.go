@@ -130,6 +130,150 @@ func TestWorkerEndToEndWithFakeRuntime(t *testing.T) {
 	}
 }
 
+func TestWorkerLoadsRepositoryWorkflowIntoPrompt(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed; skipping the workflow prompt test")
+	}
+
+	sourceRepo := newGitRepo(t)
+	workflowDir := filepath.Join(sourceRepo, ".factory", "workflows")
+	if err := os.MkdirAll(workflowDir, 0o755); err != nil {
+		t.Fatalf("create workflow dir: %v", err)
+	}
+	const workflowText = "# Implement workflow\n\n- FACTORY_TEST_WORKFLOW_SENTINEL\n"
+	if err := os.WriteFile(filepath.Join(workflowDir, "implement.md"), []byte(workflowText), 0o644); err != nil {
+		t.Fatalf("write workflow: %v", err)
+	}
+	runGit(t, sourceRepo, "add", "-A")
+	runGit(t, sourceRepo, "commit", "-m", "add implement workflow")
+
+	st, err := store.Open(filepath.Join(t.TempDir(), "workflow.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	ts := httptest.NewServer(server.New(server.Config{Store: st, DefaultLease: 2 * time.Minute}).Handler())
+	defer ts.Close()
+
+	c := client.New(ts.URL)
+	if _, err := c.AddRepository(api.CreateRepositoryRequest{
+		Owner: "local", Name: "demo", CloneURL: sourceRepo,
+	}); err != nil {
+		t.Fatalf("add repository: %v", err)
+	}
+
+	task, err := c.CreateTask(api.CreateTaskRequest{
+		Kind:      api.KindImplementTicket,
+		RepoOwner: "local",
+		RepoName:  "demo",
+		Title:     "implement with workflow",
+		Prompt:    "base implementation prompt",
+	})
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+
+	workDir := t.TempDir()
+	w, err := New(Config{
+		ServerURL: ts.URL, Name: "test-worker", WorkDir: workDir,
+		Runtime: agentruntime.FakeRuntime{}, Once: true, TaskTimeout: 2 * time.Minute,
+		Logger: testLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("new worker: %v", err)
+	}
+
+	if err := w.Run(context.Background()); err != nil {
+		t.Fatalf("worker run: %v", err)
+	}
+
+	promptPath := filepath.Join(workDir, "worktrees", task.ID, "attempt-1", ".factory-task.md")
+	promptBytes, err := os.ReadFile(promptPath)
+	if err != nil {
+		t.Fatalf("read prompt: %v", err)
+	}
+	promptText := string(promptBytes)
+	if !strings.Contains(promptText, "FACTORY_TEST_WORKFLOW_SENTINEL") {
+		t.Error("prompt did not include repository implement workflow")
+	}
+	if !strings.Contains(promptText, "base implementation prompt") {
+		t.Error("prompt did not preserve the original task prompt")
+	}
+}
+
+func TestWorkerLoadsRepositoryTriageWorkflowIntoRefinePrompt(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed; skipping the workflow prompt test")
+	}
+
+	sourceRepo := newGitRepo(t)
+	workflowDir := filepath.Join(sourceRepo, ".factory", "workflows")
+	if err := os.MkdirAll(workflowDir, 0o755); err != nil {
+		t.Fatalf("create workflow dir: %v", err)
+	}
+	const workflowText = "# Triage workflow\n\n- FACTORY_TRIAGE_WORKFLOW_SENTINEL\n"
+	if err := os.WriteFile(filepath.Join(workflowDir, "triage.md"), []byte(workflowText), 0o644); err != nil {
+		t.Fatalf("write workflow: %v", err)
+	}
+	runGit(t, sourceRepo, "add", "-A")
+	runGit(t, sourceRepo, "commit", "-m", "add triage workflow")
+
+	st, err := store.Open(filepath.Join(t.TempDir(), "triage-workflow.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	ts := httptest.NewServer(server.New(server.Config{Store: st, DefaultLease: 2 * time.Minute}).Handler())
+	defer ts.Close()
+
+	c := client.New(ts.URL)
+	if _, err := c.AddRepository(api.CreateRepositoryRequest{
+		Owner: "local", Name: "demo", CloneURL: sourceRepo,
+	}); err != nil {
+		t.Fatalf("add repository: %v", err)
+	}
+
+	task, err := c.CreateTask(api.CreateTaskRequest{
+		Kind:      api.KindRefineTicket,
+		RepoOwner: "local",
+		RepoName:  "demo",
+		Title:     "refine with workflow",
+		Prompt:    "base refine prompt",
+	})
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+
+	workDir := t.TempDir()
+	w, err := New(Config{
+		ServerURL: ts.URL, Name: "test-worker", WorkDir: workDir,
+		Runtime: agentruntime.FakeRuntime{}, Once: true, TaskTimeout: 2 * time.Minute,
+		Logger: testLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("new worker: %v", err)
+	}
+
+	if err := w.Run(context.Background()); err != nil {
+		t.Fatalf("worker run: %v", err)
+	}
+
+	promptPath := filepath.Join(workDir, "worktrees", task.ID, "attempt-1", ".factory-task.md")
+	promptBytes, err := os.ReadFile(promptPath)
+	if err != nil {
+		t.Fatalf("read prompt: %v", err)
+	}
+	promptText := string(promptBytes)
+	if !strings.Contains(promptText, "FACTORY_TRIAGE_WORKFLOW_SENTINEL") {
+		t.Error("prompt did not include repository triage workflow")
+	}
+	if !strings.Contains(promptText, "base refine prompt") {
+		t.Error("prompt did not preserve the original task prompt")
+	}
+}
+
 // TestRetryAfterAbandonedAttemptSucceeds is the regression test for the bug
 // where a retry reused the first attempt's branch and worktree directory, so
 // the second attempt died in `git worktree add` before the agent ever ran.

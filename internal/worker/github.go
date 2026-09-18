@@ -88,14 +88,24 @@ func (w *Worker) publishRefinement(task api.Task, iss githubcli.Issue, result ru
 
 	body := result.RefinedTicket
 	if strings.TrimSpace(body) == "" {
-		body = "_The runtime produced no refined ticket._"
+		body = "## Goal\n\nBLOCKED: Factory could not publish a refined ticket yet.\n\n" +
+			"## Background\n\nThe refine runtime did not write `.factory-refined.md`, so Factory has no structured ticket to move forward with.\n\n" +
+			"## Scope\n\nHuman follow-up is needed before implementation can start.\n\n" +
+			"## Out of Scope\n\nNo code changes should be made from this issue until the missing information is supplied.\n\n" +
+			"## Acceptance Criteria\n- [ ] Add the missing request details listed below.\n- [ ] Re-run the factory refine step.\n\n" +
+			"## Test Plan\n\nNot available until the request is clarified.\n\n" +
+			"## Risk Notes\n\nBLOCKED: " + orDefault(result.Reason, "the runtime produced no refined ticket") + "\n\n" +
+			"Questions for requester:\n- What screen, module, or workflow should change?\n- What exact input or action triggers the problem/request?\n- What should the user see or receive after the change?\n- What sample data, Excel file, screenshot, or expected timing should Factory use?\n\n" +
+			"Example answer:\n\"In AMS > Asset Import, upload the attached Excel file. The import should finish in under 30 seconds for 1,000 rows and show row-level errors for invalid asset codes.\"\n\n" +
+			"## Suggested Files / Areas\n\nUnknown until clarified.\n\n" +
+			"## Agent Instructions\n\nDo not implement yet. Ask for the missing details, then refine again."
 	}
 
 	verdict := labels.Ready
 	header := "🏭 **Refined ticket** — this issue is ready to implement."
 	if result.NeedsHuman {
 		verdict = labels.NeedsHuman
-		header = "🏭 **Needs a human** — this issue is too ambiguous to implement safely."
+		header = "🏭 **Needs a human** — Factory needs the missing details below before implementation."
 	}
 
 	comment := fmt.Sprintf("%s\n\n%s\n\n---\n<sub>factory task `%s` · runtime `%s`%s</sub>\n",
@@ -106,6 +116,9 @@ func (w *Worker) publishRefinement(task api.Task, iss githubcli.Issue, result ru
 	}
 	logf(api.EventGitHub, "commented refined ticket on %s#%d", repo, number)
 	milestone(logf, progress.StepSpecPosted)
+	if result.NeedsHuman {
+		milestone(logf, progress.NoteNeedsHuman+" "+orDefault(result.Reason, "the refined ticket needs clarification"))
+	}
 
 	// Remove the trigger label so the issue cannot be picked up again, and add
 	// the verdict label that decides what happens next.
@@ -140,6 +153,7 @@ func (w *Worker) publishImplementation(task api.Task, iss githubcli.Issue, wt *g
 			return fmt.Errorf("update labels: %w", err)
 		}
 		logf(api.EventGitHub, "no changes produced; marked %s#%d as %s", repo, number, labels.Blocked)
+		milestone(logf, progress.NoteBlocked+" the agent finished without changing any files")
 		return nil
 	}
 
@@ -288,6 +302,7 @@ func (w *Worker) publishReview(task api.Task, iss githubcli.Issue, pr githubcli.
 			return fmt.Errorf("update labels: %w", err)
 		}
 		logf(api.EventGitHub, "labels on %s#%d: +%s -%s", repo, iss.Number, labels.Blocked, labels.Review)
+		milestone(logf, progress.NoteBlocked+" automated review requested changes")
 	}
 	return nil
 }

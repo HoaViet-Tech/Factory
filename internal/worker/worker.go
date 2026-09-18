@@ -407,6 +407,19 @@ func (w *Worker) execute(ctx context.Context, task api.Task, logf func(string, s
 		return agentruntime.Result{}, fmt.Errorf("create worktree: %w", err)
 	}
 
+	if workflowPath := workflowPathForTask(task.Kind); workflowPath != "" {
+		workflowText, err := os.ReadFile(filepath.Join(worktreeDir, workflowPath))
+		switch {
+		case err == nil:
+			promptText = prompt.WithRepositoryWorkflow(promptText, workflowPath, string(workflowText))
+			logf(api.EventInfo, "loaded repository workflow %s (%d bytes)", workflowPath, len(workflowText))
+		case errors.Is(err, os.ErrNotExist):
+			logf(api.EventInfo, "repository workflow %s not found; using built-in %s prompt", workflowPath, task.Kind)
+		default:
+			return agentruntime.Result{}, fmt.Errorf("read repository workflow %s: %w", workflowPath, err)
+		}
+	}
+
 	// The prompt goes in the worktree so the agent can read it as a file, and
 	// so it is visible in the diff-free workspace while debugging.
 	promptFile := filepath.Join(worktreeDir, ".factory-task.md")
@@ -460,6 +473,17 @@ func (w *Worker) execute(ctx context.Context, task api.Task, logf func(string, s
 	}
 	logf(api.EventInfo, "worktree left at %s for inspection", worktreeDir)
 	return result, nil
+}
+
+func workflowPathForTask(kind string) string {
+	switch kind {
+	case api.KindRefineTicket:
+		return ".factory/workflows/triage.md"
+	case api.KindImplementTicket:
+		return ".factory/workflows/implement.md"
+	default:
+		return ""
+	}
 }
 
 // BranchName returns the git branch for one *attempt* at a task.
