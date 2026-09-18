@@ -64,6 +64,68 @@ func TestForRefineIncludesTemplateAndIssue(t *testing.T) {
 	if !strings.Contains(got, ".factory-refined.md") {
 		t.Error("the refine prompt must say where to write the ticket")
 	}
+	if !strings.Contains(got, "Ticket writing guide for the refiner") {
+		t.Error("the refine prompt must include the ticket writing guide")
+	}
+	if !strings.Contains(got, "Do not change") {
+		t.Error("the refine prompt must include the guide's do-not-change section")
+	}
+	if !strings.Contains(got, "Questions for requester") {
+		t.Error("the refine prompt must require concrete needs-human questions")
+	}
+	if !strings.Contains(got, "Never return only a vague failure sentence") {
+		t.Error("the refine prompt must forbid vague needs-human output")
+	}
+	if !strings.Contains(got, "Repository routing and compliance") {
+		t.Error("the refine prompt must include repo routing guidance")
+	}
+	if !strings.Contains(got, "confirm the issue is in the repo that owns the work") {
+		t.Error("the refine prompt must require repository compliance checks")
+	}
+	if !strings.Contains(got, untrustedOpen) {
+		t.Error("the issue body must be fenced as untrusted")
+	}
+}
+
+func TestWithRepositoryWorkflowPrependsVersionedInstructions(t *testing.T) {
+	base := ForImplement(IssueContext{
+		Repo: "local/demo", Number: 4, Title: "Fix save button",
+		Body: "The save button should persist changes.", Author: "someone",
+	})
+
+	got := WithRepositoryWorkflow(base, ".factory/workflows/implement.md", "## Implement checklist\n- Run focused tests")
+
+	if !strings.HasPrefix(got, "# Repository workflow: .factory/workflows/implement.md") {
+		t.Fatal("repository workflow should be first in the prompt")
+	}
+	if !strings.Contains(got, "## Implement checklist") {
+		t.Error("repository workflow content is missing")
+	}
+	if !strings.Contains(got, "Issue: #4") {
+		t.Error("base prompt should still be present")
+	}
+	if !strings.Contains(got, untrustedOpen) {
+		t.Error("issue body must remain fenced as untrusted")
+	}
+}
+
+func TestForImplementRequiresFactoryBranchAndDraftPR(t *testing.T) {
+	got := ForImplement(IssueContext{
+		Repo: "local/demo", Number: 4, Title: "Fix save button",
+		Body: "The save button should persist changes.", Author: "someone",
+	})
+
+	for _, want := range []string{
+		"factory-created task branch",
+		"Never commit directly to the default branch",
+		"Never reuse an unrelated branch or pull request",
+		"Open a draft PR",
+		"human review and approval",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("implement prompt is missing %q", want)
+		}
+	}
 	if !strings.Contains(got, untrustedOpen) {
 		t.Error("the issue body must be fenced as untrusted")
 	}
