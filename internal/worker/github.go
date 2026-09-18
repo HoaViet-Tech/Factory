@@ -8,8 +8,18 @@ import (
 	"github.com/HoaViet-Tech/factory/internal/githubcli"
 	"github.com/HoaViet-Tech/factory/internal/gitx"
 	"github.com/HoaViet-Tech/factory/internal/labels"
+	"github.com/HoaViet-Tech/factory/internal/progress"
 	"github.com/HoaViet-Tech/factory/internal/prompt"
 )
+
+// milestone records that the run reached a step a human is watching for.
+//
+// It is a separate call rather than a flag on the surrounding log line because
+// the message has to be the step name and nothing else: the checklist matches
+// it exactly.
+func milestone(logf func(string, string, ...any), step string) {
+	logf(api.EventMilestone, "%s", step)
+}
 
 // requiredLabel is the label an issue must still carry for a given task kind.
 func requiredLabel(kind string) string {
@@ -95,6 +105,7 @@ func (w *Worker) publishRefinement(task api.Task, iss githubcli.Issue, result ru
 		return fmt.Errorf("comment refined ticket: %w", err)
 	}
 	logf(api.EventGitHub, "commented refined ticket on %s#%d", repo, number)
+	milestone(logf, progress.StepSpecPosted)
 
 	// Remove the trigger label so the issue cannot be picked up again, and add
 	// the verdict label that decides what happens next.
@@ -176,6 +187,7 @@ func (w *Worker) publishImplementation(task api.Task, iss githubcli.Issue, wt *g
 	}
 	if url != "" {
 		logf(api.EventGitHub, "opened draft PR %s", url)
+		milestone(logf, progress.StepDraftPR)
 	}
 
 	comment := fmt.Sprintf("🏭 Draft PR opened: %s\n\n%s\n\n---\n<sub>factory task `%s`</sub>\n",
@@ -266,6 +278,7 @@ func (w *Worker) publishReview(task api.Task, iss githubcli.Issue, pr githubcli.
 		return fmt.Errorf("comment review on PR #%d: %w", pr.Number, err)
 	}
 	logf(api.EventGitHub, "posted review on PR #%d (verdict %s)", pr.Number, verdict)
+	milestone(logf, progress.StepReviewDone)
 
 	// Only a REQUEST_CHANGES moves the issue, and it moves it to blocked so a
 	// human notices. A clean review deliberately leaves the issue in

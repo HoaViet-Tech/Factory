@@ -1,5 +1,6 @@
-// Package server is the control plane: an HTTP API over the SQLite store,
-// plus two background loops (lease reaping and optional GitHub polling).
+// Package server is the control plane: an HTTP API over the SQLite store, plus
+// three background loops (lease reaping, optional GitHub polling, and optional
+// live progress updates).
 package server
 
 import (
@@ -9,10 +10,12 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/HoaViet-Tech/factory/internal/api"
 	"github.com/HoaViet-Tech/factory/internal/ingest"
+	"github.com/HoaViet-Tech/factory/internal/progress"
 	"github.com/HoaViet-Tech/factory/internal/store"
 )
 
@@ -31,7 +34,13 @@ type Config struct {
 	PollInterval time.Duration
 	// PollLimit caps issues read per label per repository.
 	PollLimit int
-	Logger    *log.Logger
+	// Notifier, when set, receives a live checklist per GitHub run. Nil turns
+	// progress updates off, which is the default: posting into a chat is an
+	// outward action and should take an explicit decision to enable.
+	Notifier progress.Notifier
+	// ProgressInterval is how often those checklists are refreshed.
+	ProgressInterval time.Duration
+	Logger           *log.Logger
 }
 
 // Server holds the wired-up control plane.
@@ -41,6 +50,9 @@ type Server struct {
 	poller *ingest.Poller
 	logger *log.Logger
 	mux    *http.ServeMux
+	// progressMu serialises checklist publishing, which both the background
+	// loop and an on-demand poll can trigger.
+	progressMu sync.Mutex
 }
 
 // New builds a Server and its routes.
@@ -56,6 +68,9 @@ func New(cfg Config) *Server {
 	}
 	if cfg.PollLimit <= 0 {
 		cfg.PollLimit = 30
+	}
+	if cfg.ProgressInterval <= 0 {
+		cfg.ProgressInterval = 10 * time.Second
 	}
 
 	s := &Server{
@@ -124,6 +139,9 @@ func (s *Server) Run(ctx context.Context, listen string) error {
 	if s.cfg.PollInterval > 0 {
 		go s.pollLoop(ctx)
 	}
+	if s.cfg.Notifier != nil {
+		go s.progressLoop(ctx)
+	}
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -176,7 +194,7 @@ func (s *Server) pollLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			resp, err := s.poller.PollOnce()
+			resp, err := s.pollOnce()
 			if err != nil {
 				s.logger.Printf("poll error: %v", err)
 				continue
@@ -186,6 +204,20 @@ func (s *Server) pollLoop(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// pollOnce runs one ingest pass and immediately publishes the checklists it
+// changed.
+//
+// Waiting for the next progress tick would work, but "I labelled the issue and
+// nothing appeared" is exactly the moment the operator is watching the chat, so
+// the first update is worth making synchronous with detection.
+func (s *Server) pollOnce() (api.PollResponse, error) {
+	resp, err := s.poller.PollOnce()
+	if err == nil && resp.TasksCreated > 0 {
+		s.publishProgress()
+	}
+	return resp, err
 }
 
 // logRequests is a tiny access log. Useful while learning: you can watch the

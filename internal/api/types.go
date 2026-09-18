@@ -42,6 +42,11 @@ const (
 	EventError    = "error"
 	EventGitHub   = "github"
 	EventComplete = "complete"
+	// EventMilestone marks a point in the run that a human is waiting for. Its
+	// message is always one of the progress package's step names verbatim, so
+	// the live checklist can match on it instead of parsing prose out of the
+	// log.
+	EventMilestone = "milestone"
 )
 
 // ValidKinds reports whether kind is a task kind the system understands.

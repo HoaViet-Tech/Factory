@@ -111,6 +111,39 @@ Bootstrap the labels once, then poll:
 ./codefactory github poll --server http://127.0.0.1:7337
 ```
 
+## Live progress in Telegram
+
+Set two environment variables and the control plane keeps one checklist message
+per issue up to date while the run happens, so you can follow it without
+tailing logs:
+
+```bash
+export FACTORY_TELEGRAM_BOT_TOKEN=123456:your-bot-token
+export FACTORY_TELEGRAM_CHAT_ID=-1001234567890
+./codefactory server --db ./factory.db
+```
+
+```text
+Factory: HoaViet-Tech/ERP.app#12
+[x] ticket detected
+[x] triage/refine started
+[x] refined spec posted
+[x] implementation started
+[ ] draft PR opened
+[ ] review completed
+[ ] waiting for human approval
+```
+
+`[!]` marks a stage that failed and `[-]` a stage this issue never goes through
+— labelling an issue `factory:ready` skips triage.
+
+The first message is sent as soon as polling detects the issue; every update
+after that edits the same message, and a tick where nothing moved costs no API
+call at all. `--progress-interval` (default 10s) controls the refresh rate. The
+token is read from the environment rather than a flag, because flags are
+visible in `ps` output; leave both variables unset and the feature is simply
+off.
+
 ## Multi-agent pipelines
 
 A worker claims only the task kinds it declares, so you assign a different
@@ -318,6 +351,8 @@ internal/githubcli/   `gh` wrapper with a dry-run mode
 internal/ingest/      Issue polling and task creation
 internal/prompt/      Prompt building and untrusted-content fencing
 internal/labels/      The factory:* label vocabulary
+internal/progress/    The live run checklist and the Notifier contract
+internal/telegram/    Bot API client that publishes that checklist
 ```
 
 ## What this intentionally is not
